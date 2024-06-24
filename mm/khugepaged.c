@@ -717,7 +717,14 @@ static bool khugepaged_scan_abort(int nid)
 /* Defrag for khugepaged will enter direct reclaim/compaction if necessary */
 static inline gfp_t alloc_hugepage_khugepaged_gfpmask(void)
 {
-	return khugepaged_defrag() ? GFP_TRANSHUGE : GFP_TRANSHUGE_LIGHT;
+	gfp_t gfp = khugepaged_defrag() ? GFP_TRANSHUGE : GFP_TRANSHUGE_LIGHT;
+
+	/*
+	 * Disable movable allocations to avoid fallback to CMA.
+	 * Unmovable allocations can fallback to movable anyway.
+	 */
+	gfp &= ~__GFP_MOVABLE;
+	return gfp;
 }
 
 #ifdef CONFIG_NUMA
@@ -1032,6 +1039,9 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 * handled by the anon_vma lock + PG_lock.
 	 */
 	down_write(&mm->mmap_sem);
+	result = SCAN_ANY_PROCESS;
+	if (!mmget_still_valid(mm))
+		goto out;
 	result = hugepage_vma_revalidate(mm, address, &vma);
 	if (result)
 		goto out;

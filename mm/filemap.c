@@ -343,6 +343,11 @@ void delete_from_page_cache(struct page *page)
 }
 EXPORT_SYMBOL(delete_from_page_cache);
 
+static int sleep_on_page_timeout(struct wait_bit_key *word, int unused)
+{
+	return io_schedule_timeout(2) ? 0 : -EAGAIN;
+}
+
 int filemap_check_errors(struct address_space *mapping)
 {
 	int ret = 0;
@@ -804,6 +809,16 @@ void wait_on_page_bit(struct page *page, int bit_nr)
 							TASK_UNINTERRUPTIBLE);
 }
 EXPORT_SYMBOL(wait_on_page_bit);
+
+void wait_on_page_bit_timeout(struct page *page, int bit_nr)
+{
+	DEFINE_WAIT_BIT(wait, &page->flags, bit_nr);
+
+	if (test_bit(bit_nr, &page->flags))
+		__wait_on_bit(page_waitqueue(page), &wait,
+				sleep_on_page_timeout, TASK_UNINTERRUPTIBLE);
+}
+EXPORT_SYMBOL(wait_on_page_bit_timeout);
 
 int wait_on_page_bit_killable(struct page *page, int bit_nr)
 {
@@ -2388,7 +2403,7 @@ static struct page *wait_on_page_read(struct page *page)
 
 static struct page *do_read_cache_page(struct address_space *mapping,
 				pgoff_t index,
-				int (*filler)(void *, struct page *),
+				int (*filler)(struct file *, struct page *),
 				void *data,
 				gfp_t gfp)
 {
@@ -2503,7 +2518,7 @@ out:
  */
 struct page *read_cache_page(struct address_space *mapping,
 				pgoff_t index,
-				int (*filler)(void *, struct page *),
+				int (*filler)(struct file *, struct page *),
 				void *data)
 {
 	return do_read_cache_page(mapping, index, filler, data, mapping_gfp_mask(mapping));
@@ -2525,7 +2540,7 @@ struct page *read_cache_page_gfp(struct address_space *mapping,
 				pgoff_t index,
 				gfp_t gfp)
 {
-	filler_t *filler = (filler_t *)mapping->a_ops->readpage;
+	filler_t *filler = mapping->a_ops->readpage;
 
 	return do_read_cache_page(mapping, index, filler, NULL, gfp);
 }

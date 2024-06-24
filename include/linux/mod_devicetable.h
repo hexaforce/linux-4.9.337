@@ -287,7 +287,7 @@ struct pcmcia_device_id {
 #define INPUT_DEVICE_ID_KEY_MAX		0x2ff
 #define INPUT_DEVICE_ID_REL_MAX		0x0f
 #define INPUT_DEVICE_ID_ABS_MAX		0x3f
-#define INPUT_DEVICE_ID_MSC_MAX		0x07
+#define INPUT_DEVICE_ID_MSC_MAX		0x09
 #define INPUT_DEVICE_ID_LED_MAX		0x0f
 #define INPUT_DEVICE_ID_SND_MAX		0x07
 #define INPUT_DEVICE_ID_FF_MAX		0x7f
@@ -425,6 +425,16 @@ struct rpmsg_device_id {
 struct i2c_device_id {
 	char name[I2C_NAME_SIZE];
 	kernel_ulong_t driver_data;	/* Data private to the driver */
+};
+
+/* pci_epf */
+
+#define PCI_EPF_NAME_SIZE	20
+#define PCI_EPF_MODULE_PREFIX	"pci_epf:"
+
+struct pci_epf_device_id {
+	char name[PCI_EPF_NAME_SIZE];
+	kernel_ulong_t driver_data;
 };
 
 /* spi */

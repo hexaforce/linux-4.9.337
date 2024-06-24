@@ -391,31 +391,35 @@ struct vivid_fmt vivid_formats[] = {
 	},
 	{
 		.fourcc   = V4L2_PIX_FMT_SBGGR10, /* Bayer BG/GR */
-		.vdownsampling = { 1 },
-		.bit_depth = { 16 },
-		.planes   = 1,
-		.buffers = 1,
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.bit_depth = { 16, 16 },
+		.planes   = 2,
+		.buffers = 2,
 	},
 	{
 		.fourcc   = V4L2_PIX_FMT_SGBRG10, /* Bayer GB/RG */
-		.vdownsampling = { 1 },
-		.bit_depth = { 16 },
-		.planes   = 1,
-		.buffers = 1,
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.bit_depth = { 16, 16 },
+		.planes   = 2,
+		.buffers = 2,
 	},
 	{
 		.fourcc   = V4L2_PIX_FMT_SGRBG10, /* Bayer GR/BG */
-		.vdownsampling = { 1 },
-		.bit_depth = { 16 },
-		.planes   = 1,
-		.buffers = 1,
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.bit_depth = { 16, 16 },
+		.planes   = 2,
+		.buffers = 2,
 	},
 	{
 		.fourcc   = V4L2_PIX_FMT_SRGGB10, /* Bayer RG/GB */
-		.vdownsampling = { 1 },
-		.bit_depth = { 16 },
-		.planes   = 1,
-		.buffers = 1,
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.bit_depth = { 16, 16 },
+		.planes   = 2,
+		.buffers = 2,
 	},
 	{
 		.fourcc   = V4L2_PIX_FMT_SBGGR12, /* Bayer BG/GR */
@@ -448,6 +452,70 @@ struct vivid_fmt vivid_formats[] = {
 
 	/* Multiplanar formats */
 
+	{
+		.fourcc   = V4L2_PIX_FMT_SBGGR16, /* Bayer BG/GR */
+		.vdownsampling = { 1 },
+		.bit_depth = { 16 },
+		.planes   = 1,
+		.buffers = 1,
+	},
+	{
+		.fourcc   = V4L2_PIX_FMT_SGBRG16, /* Bayer GB/RG */
+		.vdownsampling = { 1 },
+		.bit_depth = { 16 },
+		.planes   = 1,
+		.buffers = 1,
+	},
+	{
+		.fourcc   = V4L2_PIX_FMT_SGRBG16, /* Bayer GR/BG */
+		.vdownsampling = { 1 },
+		.bit_depth = { 16 },
+		.planes   = 1,
+		.buffers = 1,
+	},
+	{
+		.fourcc   = V4L2_PIX_FMT_SRGGB16, /* Bayer RG/GB */
+		.vdownsampling = { 1 },
+		.bit_depth = { 16 },
+		.planes   = 1,
+		.buffers = 1,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_XBGGR10P, /* Packed Bayer BG/GR */
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.packedpixels = 3,
+		.bit_depth = { 32, 32},
+		.planes = 2,
+		.buffers = 2,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_XGBRG10P, /* Packed Bayer GB/RG */
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.packedpixels = 3,
+		.bit_depth = { 32, 32 },
+		.planes = 2,
+		.buffers = 2,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_XGRBG10P, /* Packed Bayer GR/BG */
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.packedpixels = 3,
+		.bit_depth = { 32, 32 },
+		.planes = 2,
+		.buffers = 2,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_XRGGB10P, /* Packed Bayer RG/GB */
+		.is_metadata = { 0, 1},
+		.vdownsampling = { 1, 1 },
+		.packedpixels = 3,
+		.bit_depth = { 32, 32 },
+		.planes = 2,
+		.buffers = 2,
+	},
 	{
 		.fourcc   = V4L2_PIX_FMT_NV16M,
 		.vdownsampling = { 1, 1 },
@@ -535,9 +603,9 @@ struct vivid_fmt vivid_formats[] = {
 /* There are this many multiplanar formats in the list */
 #define VIVID_MPLANAR_FORMATS 10
 
-const struct vivid_fmt *vivid_get_format(struct vivid_dev *dev, u32 pixelformat)
+struct vivid_fmt *vivid_get_format(struct vivid_dev *dev, u32 pixelformat)
 {
-	const struct vivid_fmt *fmt;
+	struct vivid_fmt *fmt;
 	unsigned k;
 
 	for (k = 0; k < ARRAY_SIZE(vivid_formats); k++) {

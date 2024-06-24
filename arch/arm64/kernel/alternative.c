@@ -107,6 +107,27 @@ static u32 get_alt_insn(struct alt_instr *alt, u32 *insnptr, u32 *altinsnptr)
 	return insn;
 }
 
+/*
+ * We provide our own, private D-cache cleaning function so that we don't
+ * accidentally call into the cache.S code, which is patched by us at
+ * runtime.
+ */
+static void clean_dcache_range_nopatch(u64 start, u64 end)
+{
+	u64 cur, d_size;
+
+	d_size = 4 << ((arm64_ftr_reg_ctrel0.sys_val >> 0x10) & 0xF);
+	cur = start & ~(d_size - 1);
+	do {
+		/*
+		 * We must clean+invalidate to the PoC in order to avoid
+		 * Cortex-A53 errata 826319, 827319, 824069 and 819472
+		 * (this corresponds to ARM64_WORKAROUND_CLEAN_CACHE)
+		 */
+		asm volatile("dc civac, %0" : : "r" (cur) : "memory");
+	} while (cur += d_size, cur < end);
+}
+
 static void patch_alternative(struct alt_instr *alt,
 			      __le32 *origptr, __le32 *updptr, int nr_inst)
 {
@@ -121,8 +142,7 @@ static void patch_alternative(struct alt_instr *alt,
 		updptr[i] = cpu_to_le32(insn);
 	}
 }
-
-static void __apply_alternatives(void *alt_region)
+static void __apply_alternatives(void *alt_region, bool is_module)
 {
 	struct alt_instr *alt;
 	struct alt_region *region = alt_region;
@@ -143,7 +163,6 @@ static void __apply_alternatives(void *alt_region)
 			BUG_ON(alt->alt_len != alt->orig_len);
 
 		pr_info_once("patching kernel code\n");
-
 		origptr = ALT_ORIG_PTR(alt);
 		nr_inst = alt->orig_len / AARCH64_INSN_SIZE;
 
@@ -154,8 +173,20 @@ static void __apply_alternatives(void *alt_region)
 
 		alt_cb(alt, origptr, origptr, nr_inst);
 
-		flush_icache_range((uintptr_t)origptr,
-				   (uintptr_t)(origptr + nr_inst));
+		if (!is_module) {
+			clean_dcache_range_nopatch((u64)origptr,
+						   (u64)(origptr + nr_inst));
+		}
+	}
+
+	/*
+	 * The core module code takes care of cache maintenance in
+	 * flush_module_icache().
+	 */
+	if (!is_module) {
+		dsb(ish);
+		__flush_icache_all();
+		isb();
 	}
 }
 
@@ -177,7 +208,7 @@ static int __apply_alternatives_multi_stop(void *unused)
 		isb();
 	} else {
 		BUG_ON(alternatives_applied);
-		__apply_alternatives(&region);
+		__apply_alternatives(&region, false);
 		/* Barriers provided by the cache flushing */
 		WRITE_ONCE(alternatives_applied, 1);
 	}
@@ -191,12 +222,14 @@ void __init apply_alternatives_all(void)
 	stop_machine(__apply_alternatives_multi_stop, NULL, cpu_online_mask);
 }
 
-void apply_alternatives(void *start, size_t length)
+#ifdef CONFIG_MODULES
+void apply_alternatives_module(void *start, size_t length)
 {
 	struct alt_region region = {
 		.begin	= start,
 		.end	= start + length,
 	};
 
-	__apply_alternatives(&region);
+	__apply_alternatives(&region, true);
 }
+#endif

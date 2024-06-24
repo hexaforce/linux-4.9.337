@@ -42,6 +42,14 @@
 #include <linux/gfp.h>
 #include <linux/module.h>
 
+/* allow Tegra qdisc to restrict tcp rx datarate */
+#ifdef CONFIG_NET_SCH_TEGRA
+uint tcp_window_divisor = 1;
+uint tcp_window_max = 0;
+module_param(tcp_window_divisor, uint, 0644);
+module_param(tcp_window_max, uint, 0644);
+#endif
+
 /* People can turn this off for buggy TCP's found in printers etc. */
 int sysctl_tcp_retrans_collapse __read_mostly = 1;
 
@@ -187,14 +195,14 @@ static inline void tcp_event_ack_sent(struct sock *sk, unsigned int pkts,
 }
 
 
-u32 tcp_default_init_rwnd(u32 mss)
+u32 tcp_default_init_rwnd(struct net *net, u32 mss)
 {
 	/* Initial receive window should be twice of TCP_INIT_CWND to
 	 * enable proper sending of new unsent data during fast recovery
 	 * (RFC 3517, Section 4, NextSeg() rule (2)). Further place a
 	 * limit when mss is larger than 1460.
 	 */
-	u32 init_rwnd = TCP_INIT_CWND * 2;
+	u32 init_rwnd = net->ipv4.sysctl_tcp_default_init_rwnd;
 
 	if (mss > 1460)
 		init_rwnd = max((1460 * init_rwnd) / mss, 2U);
@@ -208,7 +216,7 @@ u32 tcp_default_init_rwnd(u32 mss)
  * be a multiple of mss if possible. We assume here that mss >= 1.
  * This MUST be enforced by all callers.
  */
-void tcp_select_initial_window(int __space, __u32 mss,
+void tcp_select_initial_window(struct net *net, int __space, __u32 mss,
 			       __u32 *rcv_wnd, __u32 *window_clamp,
 			       int wscale_ok, __u8 *rcv_wscale,
 			       __u32 init_rcv_wnd)
@@ -253,7 +261,7 @@ void tcp_select_initial_window(int __space, __u32 mss,
 
 	if (mss > (1 << *rcv_wscale)) {
 		if (!init_rcv_wnd) /* Use default unless specified otherwise */
-			init_rcv_wnd = tcp_default_init_rwnd(mss);
+			init_rcv_wnd = tcp_default_init_rwnd(net, mss);
 		*rcv_wnd = min(*rcv_wnd, init_rcv_wnd * mss);
 	}
 
@@ -298,6 +306,14 @@ static u16 tcp_select_window(struct sock *sk)
 		new_win = min(new_win, MAX_TCP_WINDOW);
 	else
 		new_win = min(new_win, (65535U << tp->rx_opt.rcv_wscale));
+
+#ifdef CONFIG_NET_SCH_TEGRA
+	if ((tcp_window_max > 0) && (new_win > tcp_window_max)) {
+		pr_debug("%s: tcp_window_max %u: new_win %d -> %d\n",
+			__func__, tcp_window_max, new_win, tcp_window_max);
+		new_win = min(new_win, tcp_window_max);
+	}
+#endif
 
 	/* RFC1323 scaling applied */
 	new_win >>= tp->rx_opt.rcv_wscale;
@@ -1000,6 +1016,17 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	skb_shinfo(skb)->gso_type = sk->sk_gso_type;
 	if (likely(!(tcb->tcp_flags & TCPHDR_SYN))) {
 		th->window      = htons(tcp_select_window(sk));
+#ifdef CONFIG_NET_SCH_TEGRA
+		if (tcp_window_divisor > 1) {
+			unsigned short window = ntohs(th->window);
+			pr_debug("%s: skb %p len %d window %hu"
+				" scale %d tp->rcv_wnd %u\n",
+				__func__, skb, skb->len, window,
+				tp->rx_opt.rcv_wscale, tp->rcv_wnd);
+			window /= tcp_window_divisor;
+			th->window = htons(window);
+		}
+#endif
 		tcp_ecn_send(sk, skb, th, tcp_header_size);
 	} else {
 		/* RFC1323: The window in SYN & SYN/ACK segments
@@ -3278,7 +3305,7 @@ static void tcp_connect_init(struct sock *sk)
 	    (tp->window_clamp > tcp_full_space(sk) || tp->window_clamp == 0))
 		tp->window_clamp = tcp_full_space(sk);
 
-	tcp_select_initial_window(tcp_full_space(sk),
+	tcp_select_initial_window(sock_net(sk), tcp_full_space(sk),
 				  tp->advmss - (tp->rx_opt.ts_recent_stamp ? tp->tcp_header_len - sizeof(struct tcphdr) : 0),
 				  &tp->rcv_wnd,
 				  &tp->window_clamp,
@@ -3336,23 +3363,11 @@ static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_fastopen_request *fo = tp->fastopen_req;
-	int syn_loss = 0, space, err = 0;
-	unsigned long last_syn_loss = 0;
+	int space, err = 0;
 	struct sk_buff *syn_data;
 
 	tp->rx_opt.mss_clamp = tp->advmss;  /* If MSS is not cached */
-	tcp_fastopen_cache_get(sk, &tp->rx_opt.mss_clamp, &fo->cookie,
-			       &syn_loss, &last_syn_loss);
-	/* Recurring FO SYN losses: revert to regular handshake temporarily */
-	if (syn_loss > 1 &&
-	    time_before(jiffies, last_syn_loss + (60*HZ << syn_loss))) {
-		fo->cookie.len = -1;
-		goto fallback;
-	}
-
-	if (sysctl_tcp_fastopen & TFO_CLIENT_NO_COOKIE)
-		fo->cookie.len = -1;
-	else if (fo->cookie.len <= 0)
+	if (!tcp_fastopen_cookie_check(sk, &tp->rx_opt.mss_clamp, &fo->cookie))
 		goto fallback;
 
 	/* MSS for SYN-data is based on cached MSS and bounded by PMTU and

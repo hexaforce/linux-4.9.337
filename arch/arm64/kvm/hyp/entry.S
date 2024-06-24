@@ -93,6 +93,8 @@ ENTRY(__guest_enter)
 
 	// Do not touch any register after this!
 	eret
+	dsb nsh
+	isb
 ENDPROC(__guest_enter)
 
 ENTRY(__guest_exit)
@@ -209,4 +211,6 @@ alternative_endif
 	ldp	x0, x1, [sp], #16
 
 	eret
+	dsb nsh
+	isb
 ENDPROC(__fpsimd_guest_restore)

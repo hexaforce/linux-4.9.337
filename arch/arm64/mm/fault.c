@@ -29,6 +29,7 @@
 #include <linux/sched.h>
 #include <linux/highmem.h>
 #include <linux/perf_event.h>
+#include <linux/fs.h>
 #include <linux/preempt.h>
 
 #include <asm/bug.h>
@@ -40,6 +41,9 @@
 #include <asm/system_misc.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/pagefault.h>
 
 struct fault_info {
 	int	(*fn)(unsigned long addr, unsigned int esr,
@@ -78,6 +82,47 @@ static inline int notify_page_fault(struct pt_regs *regs, unsigned int esr)
 }
 #endif
 
+static void data_abort_decode(unsigned int esr)
+{
+	pr_alert("Data abort info:\n");
+
+	if (esr & ESR_ELx_ISV) {
+		pr_alert("  Access size = %u byte(s)\n",
+			 1U << ((esr & ESR_ELx_SAS) >> ESR_ELx_SAS_SHIFT));
+		pr_alert("  SSE = %lu, SRT = %lu\n",
+			 (esr & ESR_ELx_SSE) >> ESR_ELx_SSE_SHIFT,
+			 (esr & ESR_ELx_SRT_MASK) >> ESR_ELx_SRT_SHIFT);
+		pr_alert("  SF = %lu, AR = %lu\n",
+			 (esr & ESR_ELx_SF) >> ESR_ELx_SF_SHIFT,
+			 (esr & ESR_ELx_AR) >> ESR_ELx_AR_SHIFT);
+	} else {
+		pr_alert("  ISV = 0, ISS = 0x%08lx\n", esr & ESR_ELx_ISS_MASK);
+	}
+
+	pr_alert("  CM = %lu, WnR = %lu\n",
+		 (esr & ESR_ELx_CM) >> ESR_ELx_CM_SHIFT,
+		 (esr & ESR_ELx_WNR) >> ESR_ELx_WNR_SHIFT);
+}
+
+static void mem_abort_decode(unsigned int esr)
+{
+	pr_alert("Mem abort info:\n");
+
+	pr_alert("  ESR = 0x%08x\n", esr);
+	pr_alert("  Exception class = %s, IL = %u bits\n",
+		 esr_get_class_string(esr),
+		 (esr & ESR_ELx_IL) ? 32 : 16);
+	pr_alert("  SET = %lu, FnV = %lu\n",
+		 (esr & ESR_ELx_SET_MASK) >> ESR_ELx_SET_SHIFT,
+		 (esr & ESR_ELx_FnV) >> ESR_ELx_FnV_SHIFT);
+	pr_alert("  EA = %lu, S1PTW = %lu\n",
+		 (esr & ESR_ELx_EA) >> ESR_ELx_EA_SHIFT,
+		 (esr & ESR_ELx_S1PTW) >> ESR_ELx_S1PTW_SHIFT);
+
+	if (esr_is_data_abort(esr))
+		data_abort_decode(esr);
+}
+
 /*
  * Dump out the page tables associated with 'addr' in the currently active mm.
  */
@@ -103,7 +148,9 @@ void show_pte(unsigned long addr)
 		return;
 	}
 
-	pr_alert("pgd = %p\n", mm->pgd);
+	pr_alert("%s pgtable: %luk pages, %u-bit VAs, pgd = %p\n",
+		 mm == &init_mm ? "swapper" : "user", PAGE_SIZE / SZ_1K,
+		 VA_BITS, mm->pgd);
 	pgd = pgd_offset(mm, addr);
 	pr_alert("[%016lx] *pgd=%016llx", addr, pgd_val(*pgd));
 
@@ -188,12 +235,33 @@ static bool is_el1_instruction_abort(unsigned int esr)
 	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_CUR;
 }
 
+static inline bool is_permission_fault(unsigned int esr, struct pt_regs *regs,
+				       unsigned long addr)
+{
+	unsigned int ec       = ESR_ELx_EC(esr);
+	unsigned int fsc_type = esr & ESR_ELx_FSC_TYPE;
+
+	if (ec != ESR_ELx_EC_DABT_CUR && ec != ESR_ELx_EC_IABT_CUR)
+		return false;
+
+	if (fsc_type == ESR_ELx_FSC_PERM)
+		return true;
+
+	if (addr < USER_DS && system_uses_ttbr0_pan())
+		return fsc_type == ESR_ELx_FSC_FAULT &&
+			(regs->pstate & PSR_PAN_BIT);
+
+	return false;
+}
+
 /*
  * The kernel tried to access some page that wasn't present.
  */
 static void __do_kernel_fault(unsigned long addr, unsigned int esr,
 			      struct pt_regs *regs)
 {
+	const char *msg;
+
 	/*
 	 * Are we prepared to handle this kernel fault?
 	 * We are almost certainly not prepared to handle instruction faults.
@@ -205,14 +273,47 @@ static void __do_kernel_fault(unsigned long addr, unsigned int esr,
 	 * No handler, we'll have to terminate things with extreme prejudice.
 	 */
 	bust_spinlocks(1);
-	pr_alert("Unable to handle kernel %s at virtual address %08lx\n",
-		 (addr < PAGE_SIZE) ? "NULL pointer dereference" :
-		 "paging request", addr);
+
+	if (is_permission_fault(esr, regs, addr)) {
+		if (esr & ESR_ELx_WNR)
+			msg = "write to read-only memory";
+		else
+			msg = "read from unreadable memory";
+	} else if (addr < PAGE_SIZE) {
+		msg = "NULL pointer dereference";
+	} else {
+		msg = "paging request";
+	}
+
+	pr_alert("Unable to handle kernel %s at virtual address %08lx\n", msg,
+					 addr);
+
+	mem_abort_decode(esr);
 
 	show_pte(addr);
 	die("Oops", regs, esr);
 	bust_spinlocks(0);
 	do_exit(SIGKILL);
+}
+
+static void show_map(struct task_struct *tsk, u64 addr)
+{
+	struct vm_area_struct *vma;
+	struct file *file;
+	struct mm_struct *mm = tsk->mm;
+	char path[64];
+	char *p;
+
+	vma = find_vma(mm, addr);
+	if (!vma)
+		return;
+	file = vma->vm_file;
+	if (!file)
+		return;
+	p = d_path(&file->f_path, &path[0], 64);
+	if (IS_ERR(p))
+		return;
+	pr_alert("Library at 0x%llx: 0x%lx %s\n", addr, vma->vm_start, p);
 }
 
 /*
@@ -231,7 +332,14 @@ static void __do_user_fault(struct task_struct *tsk, unsigned long addr,
 		pr_info("%s[%d]: unhandled %s (%d) at 0x%08lx, esr 0x%03x\n",
 			tsk->comm, task_pid_nr(tsk), inf->name, sig,
 			addr, esr);
+		show_pte(addr);
 		show_regs(regs);
+		show_map(tsk, instruction_pointer(regs));
+		if (compat_user_mode(regs))
+			show_map(tsk, regs->compat_lr);
+		else
+			show_map(tsk, regs->regs[30]);
+		pr_alert("vdso base = 0x%lx\n", (unsigned long)tsk->mm->context.vdso);
 	}
 
 	tsk->thread.fault_address = addr;
@@ -240,6 +348,7 @@ static void __do_user_fault(struct task_struct *tsk, unsigned long addr,
 	si.si_errno = 0;
 	si.si_code = code;
 	si.si_addr = (void __user *)addr;
+
 	force_sig_info(sig, &si, tsk);
 }
 
@@ -299,15 +408,6 @@ out:
 	return fault;
 }
 
-static inline bool is_permission_fault(unsigned int esr)
-{
-	unsigned int ec       = ESR_ELx_EC(esr);
-	unsigned int fsc_type = esr & ESR_ELx_FSC_TYPE;
-
-	return (ec == ESR_ELx_EC_DABT_CUR && fsc_type == ESR_ELx_FSC_PERM) ||
-	       (ec == ESR_ELx_EC_IABT_CUR && fsc_type == ESR_ELx_FSC_PERM);
-}
-
 static bool is_el0_instruction_abort(unsigned int esr)
 {
 	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW;
@@ -321,6 +421,8 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 	int fault, sig, code;
 	unsigned long vm_flags = VM_READ | VM_WRITE | VM_EXEC;
 	unsigned int mm_flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
+
+	trace_pagefault_entry(addr);
 
 	if (notify_page_fault(regs, esr))
 		return 0;
@@ -345,7 +447,7 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 		mm_flags |= FAULT_FLAG_WRITE;
 	}
 
-	if (is_permission_fault(esr) && (addr < TASK_SIZE)) {
+	if (addr < TASK_SIZE && is_permission_fault(esr, regs, addr)) {
 		/* regs->orig_addr_limit may be 0 if we entered from EL0 */
 		if (regs->orig_addr_limit == KERNEL_DS)
 			die("Accessing user space memory with fs=KERNEL_DS", regs, esr);
@@ -610,8 +712,8 @@ asmlinkage void __exception do_el0_irq_bp_hardening(void)
 }
 
 asmlinkage void __exception do_el0_ia_bp_hardening(unsigned long addr,
-						   unsigned int esr,
-						   struct pt_regs *regs)
+                                                  unsigned int esr,
+                                                  struct pt_regs *regs)
 {
 	/*
 	 * We've taken an instruction abort from userspace and not yet
@@ -624,7 +726,6 @@ asmlinkage void __exception do_el0_ia_bp_hardening(unsigned long addr,
 	local_irq_enable();
 	do_mem_abort(addr, esr, regs);
 }
-
 
 /*
  * Handle stack alignment exceptions.

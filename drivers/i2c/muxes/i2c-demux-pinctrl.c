@@ -272,6 +272,7 @@ err_rollback_available:
 err_rollback_activation:
 	i2c_demux_deactivate_master(priv);
 err_rollback:
+	i2c_demux_deactivate_master(priv);
 	for (j = 0; j < i; j++) {
 		of_node_put(priv->chan[j].parent_np);
 		of_changeset_destroy(&priv->chan[j].chgset);

@@ -47,6 +47,7 @@
 #include <linux/prefetch.h>
 #include <linux/printk.h>
 #include <linux/dax.h>
+#include <linux/psi.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -267,6 +268,16 @@ unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru, int zone
 
 	return lru_size;
 
+}
+
+/* If zram is being used as swap, and zram is using zsmalloc allocator
+ * then there is a potential bug when reclaim happens from interrupt
+ * context
+ */
+static void adjust_scan_control(struct scan_control *sc)
+{
+	if (in_interrupt() && IS_ENABLED(ZSMALLOC) && total_swap_pages)
+		sc->may_swap = 0;
 }
 
 /*
@@ -1315,6 +1326,7 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
 	unsigned long ret, dummy1, dummy2, dummy3, dummy4, dummy5;
 	struct page *page, *next;
 	LIST_HEAD(clean_pages);
+	adjust_scan_control(&sc);
 
 	list_for_each_entry_safe(page, next, page_list, lru) {
 		if (page_is_file_cache(page) && !PageDirty(page) &&
@@ -1594,30 +1606,31 @@ int isolate_lru_page(struct page *page)
 	return ret;
 }
 
-/*
- * A direct reclaimer may isolate SWAP_CLUSTER_MAX pages from the LRU list and
- * then get resheduled. When there are massive number of tasks doing page
- * allocation, such sleeping direct reclaimers may keep piling up on each CPU,
- * the LRU list will go small and be scanned faster than necessary, leading to
- * unnecessary swapping, thrashing and OOM.
- */
-static int too_many_isolated(struct pglist_data *pgdat, int file,
-		struct scan_control *sc)
+static int __too_many_isolated(struct pglist_data *pgdat, int file,
+	struct scan_control *sc, int safe)
 {
 	unsigned long inactive, isolated;
 
-	if (current_is_kswapd())
-		return 0;
-
-	if (!sane_reclaim(sc))
-		return 0;
-
 	if (file) {
-		inactive = node_page_state(pgdat, NR_INACTIVE_FILE);
-		isolated = node_page_state(pgdat, NR_ISOLATED_FILE);
+		if (safe) {
+			inactive = node_page_state_snapshot(pgdat,
+					NR_INACTIVE_FILE);
+			isolated = node_page_state_snapshot(pgdat,
+					NR_ISOLATED_FILE);
+		} else {
+			inactive = node_page_state(zone, NR_INACTIVE_FILE);
+			isolated = node_page_state(zone, NR_ISOLATED_FILE);
+		}
 	} else {
-		inactive = node_page_state(pgdat, NR_INACTIVE_ANON);
-		isolated = node_page_state(pgdat, NR_ISOLATED_ANON);
+		if (safe) {
+			inactive = node_page_state_snapshot(pgdat,
+					NR_INACTIVE_ANON);
+			isolated = node_page_state_snapshot(pgdat,
+					NR_ISOLATED_ANON);
+		} else {
+			inactive = node_page_state(pgdat, NR_INACTIVE_ANON);
+			isolated = node_page_state(pgdat, NR_ISOLATED_ANON);
+		}
 	}
 
 	/*
@@ -1629,6 +1642,50 @@ static int too_many_isolated(struct pglist_data *pgdat, int file,
 		inactive >>= 3;
 
 	return isolated > inactive;
+}
+
+static atomic_t enable_congestion = ATOMIC_INIT(0);
+
+void mm_disable_congestion_wait(void)
+{
+	atomic_inc(&enable_congestion);
+}
+
+void mm_enable_congestion_wait(void)
+{
+	atomic_dec(&enable_congestion);
+}
+
+/*
+ * A direct reclaimer may isolate SWAP_CLUSTER_MAX pages from the LRU list and
+ * then get resheduled. When there are massive number of tasks doing page
+ * allocation, such sleeping direct reclaimers may keep piling up on each CPU,
+ * the LRU list will go small and be scanned faster than necessary, leading to
+ * unnecessary swapping, thrashing and OOM.
+ */
+static int too_many_isolated(struct pglist_data *pgdat, int file,
+		struct scan_control *sc, int safe)
+{
+	if (current_is_kswapd())
+		return 0;
+
+	if (!sane_reclaim(sc))
+		return 0;
+
+	/* IF CMA migration is in progress, disable congestion
+	 * to avoid dead lock in allocating memory for migration.
+	 */
+	if (atomic_read(&enable_congestion))
+		return 0;
+
+	if (unlikely(__too_many_isolated(pgdat, file, sc, 0))) {
+		if (safe)
+			return __too_many_isolated(pgdat, file, sc, safe);
+		else
+			return 1;
+	}
+
+	return 0;
 }
 
 static noinline_for_stack void
@@ -1742,18 +1799,21 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	unsigned long nr_immediate = 0;
 	isolate_mode_t isolate_mode = 0;
 	int file = is_file_lru(lru);
+	int safe = 0;
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
 
 	if (!inactive_reclaimable_pages(lruvec, sc, lru))
 		return 0;
 
-	while (unlikely(too_many_isolated(pgdat, file, sc))) {
+	while (unlikely(too_many_isolated(pgdat, file, sc, safe))) {
 		congestion_wait(BLK_RW_ASYNC, HZ/10);
 
 		/* We are about to die and free our memory. Return now. */
 		if (fatal_signal_pending(current))
 			return SWAP_CLUSTER_MAX;
+
+		safe = 1;
 	}
 
 	lru_add_drain();
@@ -2004,6 +2064,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
 		}
 
 		ClearPageActive(page);	/* we are de-activating */
+		SetPageWorkingset(page);
 		list_add(&page->lru, &l_inactive);
 	}
 
@@ -2986,6 +3047,8 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.may_swap = 1,
 	};
 
+	adjust_scan_control(&sc);
+
 	/*
 	 * Do not enter reclaim if fatal signal was delivered while throttled.
 	 * 1 is returned so that the page allocator does not OOM kill at this
@@ -3023,6 +3086,8 @@ unsigned long mem_cgroup_shrink_node(struct mem_cgroup *memcg,
 	};
 	unsigned long lru_pages;
 
+	adjust_scan_control(&sc);
+
 	sc.gfp_mask = (gfp_mask & GFP_RECLAIM_MASK) |
 			(GFP_HIGHUSER_MOVABLE & ~GFP_RECLAIM_MASK);
 
@@ -3053,6 +3118,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 {
 	struct zonelist *zonelist;
 	unsigned long nr_reclaimed;
+	unsigned long pflags;
 	int nid;
 	struct scan_control sc = {
 		.nr_to_reclaim = max(nr_pages, SWAP_CLUSTER_MAX),
@@ -3066,6 +3132,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 		.may_swap = may_swap,
 	};
 
+	adjust_scan_control(&sc);
 	/*
 	 * Unlike direct reclaim via alloc_pages(), memcg's reclaim doesn't
 	 * take care of from where we get pages. So the node where we start the
@@ -3080,9 +3147,13 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 					    sc.gfp_mask,
 					    sc.reclaim_idx);
 
+	psi_memstall_enter(&pflags);
 	current->flags |= PF_MEMALLOC;
+
 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
+
 	current->flags &= ~PF_MEMALLOC;
+	psi_memstall_leave(&pflags);
 
 	trace_mm_vmscan_memcg_reclaim_end(nr_reclaimed);
 
@@ -3232,6 +3303,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int classzone_idx)
 	int i;
 	unsigned long nr_soft_reclaimed;
 	unsigned long nr_soft_scanned;
+	unsigned long pflags;
 	struct zone *zone;
 	struct scan_control sc = {
 		.gfp_mask = GFP_KERNEL,
@@ -3241,6 +3313,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int classzone_idx)
 		.may_unmap = 1,
 		.may_swap = 1,
 	};
+	adjust_scan_control(&sc);
 	count_vm_event(PAGEOUTRUN);
 
 	do {
@@ -3345,6 +3418,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int classzone_idx)
 		pgdat->kswapd_failures++;
 
 out:
+	psi_memstall_leave(&pflags);
 	/*
 	 * Return the order kswapd stopped reclaiming at as
 	 * prepare_kswapd_sleep() takes it into account. If another caller
@@ -3532,6 +3606,21 @@ void wakeup_kswapd(struct zone *zone, int order, enum zone_type classzone_idx)
 	pg_data_t *pgdat;
 	int z;
 
+	/* Check whether ZRAM is disabled. */
+	if(!total_swap_pages) {
+		/* Avoid kswapd for HIGH MEMORY ZONE. */
+#ifdef CONFIG_HIGHMEM
+                if (classzone_idx == ZONE_HIGHMEM)
+                        return;
+#endif
+
+#ifdef CONFIG_ZONE_DMA32
+	/* Avoid Normal zone balancing when DMA32 zone exist. */
+		if (classzone_idx == ZONE_NORMAL)
+			return;
+#endif
+	}
+
 	if (!managed_zone(zone))
 		return;
 
@@ -3587,6 +3676,7 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 	struct task_struct *p = current;
 	unsigned long nr_reclaimed;
 
+	adjust_scan_control(&sc);
 	p->flags |= PF_MEMALLOC;
 	lockdep_set_current_reclaim_state(sc.gfp_mask);
 	reclaim_state.reclaimed_slab = 0;
@@ -3771,6 +3861,7 @@ static int __node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned in
 		.reclaim_idx = gfp_zone(gfp_mask),
 	};
 
+	adjust_scan_control(&sc);
 	cond_resched();
 	/*
 	 * We need to be able to allocate from the reserves for RECLAIM_UNMAP

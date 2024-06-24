@@ -645,6 +645,7 @@ void phy_start_machine(struct phy_device *phydev)
 {
 	queue_delayed_work(system_power_efficient_wq, &phydev->state_queue, HZ);
 }
+EXPORT_SYMBOL(phy_start_machine);
 
 /**
  * phy_trigger_machine - trigger the state machine to run
@@ -783,7 +784,7 @@ int phy_start_interrupts(struct phy_device *phydev)
 {
 	atomic_set(&phydev->irq_disable, 0);
 	if (request_irq(phydev->irq, phy_interrupt,
-				IRQF_SHARED,
+				IRQF_TRIGGER_LOW,
 				"phy_interrupt",
 				phydev) < 0) {
 		pr_warn("%s: Can't get IRQ %d (PHY)\n",

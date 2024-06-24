@@ -153,6 +153,7 @@ enum node_stat_item {
 	NR_PAGES_SCANNED,	/* pages scanned since last reclaim */
 	WORKINGSET_REFAULT,
 	WORKINGSET_ACTIVATE,
+	WORKINGSET_RESTORE,
 	WORKINGSET_NODERECLAIM,
 	NR_ANON_MAPPED,	/* Mapped anonymous pages */
 	NR_FILE_MAPPED,	/* pagecache pages mapped into pagetables.
@@ -753,6 +754,13 @@ static inline bool is_dev_zone(const struct zone *zone)
 }
 #endif
 
+#ifndef CONFIG_NEED_MULTIPLE_NODES
+
+extern struct pglist_data contig_page_data;
+#define NODE_DATA(nid)		(&contig_page_data)
+#define NODE_MEM_MAP(nid)	mem_map
+#endif
+
 #include <linux/memory_hotplug.h>
 
 extern struct mutex zonelists_mutex;
@@ -886,10 +894,6 @@ extern char numa_zonelist_order[];
 
 #ifndef CONFIG_NEED_MULTIPLE_NODES
 
-extern struct pglist_data contig_page_data;
-#define NODE_DATA(nid)		(&contig_page_data)
-#define NODE_MEM_MAP(nid)	mem_map
-
 #else /* CONFIG_NEED_MULTIPLE_NODES */
 
 #include <asm/mmzone.h>
@@ -968,7 +972,7 @@ static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
 					enum zone_type highest_zoneidx,
 					nodemask_t *nodes)
 {
-	if (likely(!nodes && zonelist_zone_idx(z) <= highest_zoneidx))
+	if (likely(!nodes && zonelist_zone_idx(z) <= (int)highest_zoneidx))
 		return z;
 	return __next_zones_zonelist(z, highest_zoneidx, nodes);
 }

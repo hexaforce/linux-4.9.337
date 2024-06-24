@@ -42,6 +42,15 @@
 	msr	daifclr, #2
 	.endm
 
+	.macro	save_and_disable_irq, flags
+	mrs	\flags, daif
+	msr	daifset, #2
+	.endm
+
+	.macro	restore_irq, flags
+	msr	daif, \flags
+	.endm
+
 /*
  * Enable and disable debug exceptions.
  */
@@ -80,6 +89,11 @@
 	msr	daifclr, #(8 | 2)
 	.endm
 
+	/* IRQ is the lowest priority flag, unconditionally unmask the rest. */
+	.macro enable_da_f
+	msr     daifclr, #(8 | 4 | 1)
+	.endm
+
 /*
  * SMP data memory barrier
  */
@@ -87,7 +101,8 @@
 	dmb	\opt
 	.endm
 
-/*
+ 
+ /*
  * Value prediction barrier
  */
 	.macro	csdb
@@ -387,6 +402,35 @@ alternative_endif
 	.endm
 
 /*
+ * Macro to perform a data cache maintenance for the interval
+ * [kaddr, kaddr + size) without dsb
+ *
+ * 	op:		operation passed to dc instruction
+ * 	kaddr:		starting virtual address of the region
+ * 	size:		size of the region
+ * 	Corrupts:	kaddr, size, tmp1, tmp2
+ */
+	.macro dcache_by_line_op_no_dsb op, kaddr, size, tmp1, tmp2
+	dcache_line_size \tmp1, \tmp2
+	add	\size, \kaddr, \size
+	sub	\tmp2, \tmp1, #1
+	bic	\kaddr, \kaddr, \tmp2
+9998:
+	.if	(\op == cvau || \op == cvac)
+alternative_if_not ARM64_WORKAROUND_CLEAN_CACHE
+	dc	\op, \kaddr
+alternative_else
+	dc	civac, \kaddr
+alternative_endif
+	.else
+	dc	\op, \kaddr
+	.endif
+	add	\kaddr, \kaddr, \tmp1
+	cmp	\kaddr, \size
+	b.lo	9998b
+	.endm
+
+/*
  * reset_pmuserenr_el0 - reset PMUSERENR_EL0 if PMUv3 present
  */
 	.macro	reset_pmuserenr_el0, tmpreg
@@ -456,6 +500,26 @@ alternative_endif
 	movk	\reg, :abs_g1_nc:\val
 	.endif
 	movk	\reg, :abs_g0_nc:\val
+	.endm
+
+/*
+ * Return the current thread_info.
+ */
+	.macro	get_thread_info, rd
+	mrs	\rd, sp_el0
+	.endm
+
+/*
+ * Errata workaround post TTBR0_EL1 update.
+ */
+	.macro	post_ttbr0_update_workaround
+#ifdef CONFIG_CAVIUM_ERRATUM_27456
+alternative_if ARM64_WORKAROUND_CAVIUM_27456
+	ic	iallu
+	dsb	nsh
+	isb
+alternative_else_nop_endif
+#endif
 	.endm
 
 	.macro	pte_to_phys, phys, pte

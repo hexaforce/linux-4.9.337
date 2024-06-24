@@ -187,6 +187,10 @@ struct hda_codec {
 	unsigned int addr;	/* codec addr*/
 	u32 probe_id; /* overridden id for probing */
 
+	/* fields for custom ELD */
+	unsigned int *custom_eld_data;
+	unsigned int custom_eld_size;
+
 	/* detected preset */
 	const struct hda_device_id *preset;
 	const char *modelname;	/* model name for preset */
@@ -270,6 +274,10 @@ struct hda_codec {
 	/* codec-specific additional proc output */
 	void (*proc_widget_hook)(struct snd_info_buffer *buffer,
 				 struct hda_codec *codec, hda_nid_t nid);
+
+	unsigned int recv_dec_cap;
+	unsigned int max_pcm_channels;
+	bool comfort_noise;
 
 	/* jack detection */
 	struct snd_array jacktbl;

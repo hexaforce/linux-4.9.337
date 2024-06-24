@@ -123,6 +123,11 @@ static int kernfs_path_from_node_locked(struct kernfs_node *kn_to,
 	size_t depth_from, depth_to, len = 0;
 	int i, j;
 
+	if (!buf && buflen > 0) {
+		WARN(1, "writing to NULL pointer ???\n");
+		return -EINVAL;
+	}
+
 	if (!kn_from)
 		kn_from = kernfs_root(kn_to)->kn;
 
@@ -468,7 +473,7 @@ static void kernfs_drain(struct kernfs_node *kn)
 		rwsem_release(&kn->dep_map, 1, _RET_IP_);
 	}
 
-	kernfs_unmap_bin_file(kn);
+	kernfs_drain_open_files(kn);
 
 	mutex_lock(&kernfs_mutex);
 }

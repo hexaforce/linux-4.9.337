@@ -60,9 +60,6 @@
 #define USB_DEVICE_MAX			(USB_MAXBUS * 128)
 #define USB_SG_SIZE			16384 /* split-size for large txs */
 
-/* Mutual exclusion for removal, open, and release */
-DEFINE_MUTEX(usbfs_mutex);
-
 struct usb_dev_state {
 	struct list_head list;      /* state list */
 	struct usb_device *dev;
@@ -254,7 +251,12 @@ static int usbdev_mmap(struct file *file, struct vm_area_struct *vma)
 	usbm->vma_use_count = 1;
 	INIT_LIST_HEAD(&usbm->memlist);
 
-	if (remap_pfn_range(vma, vma->vm_start,
+	if (is_vmalloc_addr(usbm->mem)) {
+		if (remap_vmalloc_range(vma, usbm->mem, 0) < 0) {
+			dec_usb_memory_use_count(usbm, &usbm->vma_use_count);
+			return -EAGAIN;
+		}
+	} else if (remap_pfn_range(vma, vma->vm_start,
 			virt_to_phys(usbm->mem) >> PAGE_SHIFT,
 			size, vma->vm_page_prot) < 0) {
 		dec_usb_memory_use_count(usbm, &usbm->vma_use_count);
@@ -1007,15 +1009,9 @@ static int usbdev_open(struct inode *inode, struct file *file)
 
 	ret = -ENODEV;
 
-	/* Protect against simultaneous removal or release */
-	mutex_lock(&usbfs_mutex);
-
 	/* usbdev device-node */
 	if (imajor(inode) == USB_DEVICE_MAJOR)
 		dev = usbdev_lookup_by_devt(inode->i_rdev);
-
-	mutex_unlock(&usbfs_mutex);
-
 	if (!dev)
 		goto out_free_ps;
 

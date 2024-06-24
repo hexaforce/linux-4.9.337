@@ -32,7 +32,9 @@
 #include <asm/memory.h>
 #include <asm/mmu.h>
 #include <asm/processor.h>
+#include <asm/ptrace.h>
 #include <asm/thread_info.h>
+#include <asm/uaccess.h>
 #include <asm/asm-uaccess.h>
 #include <asm/unistd.h>
 #include <asm/kernel-pgtable.h>
@@ -112,7 +114,7 @@ alternative_cb	arm64_enable_wa2_handling
 alternative_cb_end
 	ldr_this_cpu	\tmp2, arm64_ssbd_callback_required, \tmp1
 	cbz	\tmp2, \targ
-	ldr	\tmp2, [tsk, #TI_FLAGS]
+	ldr	\tmp2, [tsk, #TSK_TI_FLAGS]
 	tbnz	\tmp2, #TIF_SSBD, \targ
 	mov	w0, #ARM_SMCCC_ARCH_WORKAROUND_2
 	mov	w1, #\state
@@ -144,9 +146,8 @@ alternative_cb_end
 
 	.if	\el == 0
 	mrs	x21, sp_el0
-	mov	tsk, sp
-	and	tsk, tsk, #~(THREAD_SIZE - 1)	// Ensure MDSCR_EL1.SS is clear,
-	ldr	x19, [tsk, #TI_FLAGS]		// since we can unmask debug
+	ldr_this_cpu	tsk, __entry_task, x20	// Ensure MDSCR_EL1.SS is clear,
+	ldr	x19, [tsk, #TSK_TI_FLAGS]	// since we can unmask debug
 	disable_step_tsk x19, x20		// exceptions when scheduling.
 
 	apply_ssbd 1, 1f, x22, x23
@@ -162,15 +163,41 @@ alternative_cb_end
 	add	x21, sp, #S_FRAME_SIZE
 	get_thread_info tsk
 	/* Save the task's original addr_limit and set USER_DS */
-	ldr	x20, [tsk, #TI_ADDR_LIMIT]
+	ldr	x20, [tsk, #TSK_TI_ADDR_LIMIT]
 	str	x20, [sp, #S_ORIG_ADDR_LIMIT]
 	mov	x20, #USER_DS
-	str	x20, [tsk, #TI_ADDR_LIMIT]
+	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
 	/* No need to reset PSTATE.UAO, hardware's already set it to 0 for us */
 	.endif /* \el == 0 */
 	mrs	x22, elr_el1
 	mrs	x23, spsr_el1
 	stp	lr, x21, [sp, #S_LR]
+
+#ifdef CONFIG_ARM64_SW_TTBR0_PAN
+	/*
+	 * Set the TTBR0 PAN bit in SPSR. When the exception is taken from
+	 * EL0, there is no need to check the state of TTBR0_EL1 since
+	 * accesses are always enabled.
+	 * Note that the meaning of this bit differs from the ARMv8.1 PAN
+	 * feature as all TTBR0_EL1 accesses are disabled, not just those to
+	 * user mappings.
+	 */
+alternative_if ARM64_HAS_PAN
+	b	1f				// skip TTBR0 PAN
+alternative_else_nop_endif
+
+	.if	\el != 0
+	mrs	x21, ttbr0_el1
+	tst	x21, #TTBR_ASID_MASK		// Check for the reserved ASID
+	orr	x23, x23, #PSR_PAN_BIT		// Set the emulated PAN in the saved SPSR
+	b.eq	1f				// TTBR0 access already disabled
+	and	x23, x23, #~PSR_PAN_BIT		// Clear the emulated PAN in the saved SPSR
+	.endif
+
+	__uaccess_ttbr0_disable x21
+1:
+#endif
+
 	stp	x22, x23, [sp, #S_PC]
 
 	/*
@@ -201,7 +228,7 @@ alternative_cb_end
 	.if	\el != 0
 	/* Restore the task's original addr_limit. */
 	ldr	x20, [sp, #S_ORIG_ADDR_LIMIT]
-	str	x20, [tsk, #TI_ADDR_LIMIT]
+	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
 
 	/* No need to restore UAO, it will be restored from SPSR_EL1 */
 	.endif
@@ -209,6 +236,40 @@ alternative_cb_end
 	ldp	x21, x22, [sp, #S_PC]		// load ELR, SPSR
 	.if	\el == 0
 	ct_user_enter
+	.endif
+
+#ifdef CONFIG_ARM64_SW_TTBR0_PAN
+	/*
+	 * Restore access to TTBR0_EL1. If returning to EL0, no need for SPSR
+	 * PAN bit checking.
+	 */
+alternative_if ARM64_HAS_PAN
+	b	2f				// skip TTBR0 PAN
+alternative_else_nop_endif
+
+	.if	\el != 0
+	tbnz	x22, #22, 1f			// Skip re-enabling TTBR0 access if the PSR_PAN_BIT is set
+	.endif
+
+	__uaccess_ttbr0_enable x0, x1
+
+	.if	\el == 0
+	/*
+	 * Enable errata workarounds only if returning to user. The only
+	 * workaround currently required for TTBR0_EL1 changes are for the
+	 * Cavium erratum 27456 (broadcast TLBI instructions may cause I-cache
+	 * corruption).
+	 */
+	bl	post_ttbr_update_workaround
+	.endif
+1:
+	.if	\el != 0
+	and	x22, x22, #~PSR_PAN_BIT		// ARMv8.0 CPUs do not understand this bit
+	.endif
+2:
+#endif
+
+	.if	\el == 0
 	ldr	x23, [sp, #S_SP]		// load return stack pointer
 	msr	sp_el0, x23
 	tst	x22, #PSR_MODE32_BIT		// native task?
@@ -228,6 +289,7 @@ alternative_else_nop_endif
 	apply_ssbd 0, 5f, x0, x1
 5:
 	.endif
+
 	msr	elr_el1, x21			// set up the return data
 	msr	spsr_el1, x22
 	ldp	x0, x1, [sp, #16 * 0]
@@ -266,23 +328,22 @@ alternative_else_nop_endif
 	add	sp, sp, #S_FRAME_SIZE		// restore sp
 	eret
 	.endif
-	.endm
-
-	.macro	get_thread_info, rd
-	mrs	\rd, sp_el0
+	dsb nsh
+	isb
 	.endm
 
 	.macro	irq_stack_entry
 	mov	x19, sp			// preserve the original sp
 
 	/*
-	 * Compare sp with the current thread_info, if the top
-	 * ~(THREAD_SIZE - 1) bits match, we are on a task stack, and
-	 * should switch to the irq stack.
+	 * Compare sp with the base of the task stack.
+	 * If the top ~(THREAD_SIZE - 1) bits match, we are on a task stack,
+	 * and should switch to the irq stack.
 	 */
-	and	x25, x19, #~(THREAD_SIZE - 1)
-	cmp	x25, tsk
-	b.ne	9998f
+	ldr	x25, [tsk, TSK_STACK]
+	eor	x25, x25, x19
+	and	x25, x25, #~(THREAD_SIZE - 1)
+	cbnz	x25, 9998f
 
 	adr_this_cpu x25, irq_stack, x26
 	mov	x26, #IRQ_STACK_START_SP
@@ -348,18 +409,18 @@ ENTRY(vectors)
 	kernel_ventry	1, sync				// Synchronous EL1h
 	kernel_ventry	1, irq				// IRQ EL1h
 	kernel_ventry	1, fiq_invalid			// FIQ EL1h
-	kernel_ventry	1, error_invalid		// Error EL1h
+	kernel_ventry	1, serr				// Error EL1h
 
 	kernel_ventry	0, sync				// Synchronous 64-bit EL0
 	kernel_ventry	0, irq				// IRQ 64-bit EL0
 	kernel_ventry	0, fiq_invalid			// FIQ 64-bit EL0
-	kernel_ventry	0, error_invalid		// Error 64-bit EL0
+	kernel_ventry	0, serr				// Error 64-bit EL0
 
 #ifdef CONFIG_COMPAT
 	kernel_ventry	0, sync_compat, 32		// Synchronous 32-bit EL0
 	kernel_ventry	0, irq_compat, 32		// IRQ 32-bit EL0
 	kernel_ventry	0, fiq_invalid_compat, 32	// FIQ 32-bit EL0
-	kernel_ventry	0, error_invalid_compat, 32	// Error 32-bit EL0
+	kernel_ventry	0, serr_compat, 32		// Error 32-bit EL0
 #else
 	kernel_ventry	0, sync_invalid, 32		// Synchronous 32-bit EL0
 	kernel_ventry	0, irq_invalid, 32		// IRQ 32-bit EL0
@@ -480,7 +541,8 @@ el1_undef:
 	 */
 	enable_dbg
 	mov	x0, sp
-	b	do_undefinstr
+	bl	do_undefinstr
+	kernel_exit 1
 el1_dbg:
 	/*
 	 * Debug exception handling
@@ -512,9 +574,9 @@ el1_irq:
 	irq_handler
 
 #ifdef CONFIG_PREEMPT
-	ldr	w24, [tsk, #TI_PREEMPT]		// get preempt count
+	ldr	w24, [tsk, #TSK_TI_PREEMPT]	// get preempt count
 	cbnz	w24, 1f				// preempt count != 0
-	ldr	x0, [tsk, #TI_FLAGS]		// get flags
+	ldr	x0, [tsk, #TSK_TI_FLAGS]	// get flags
 	tbz	x0, #TIF_NEED_RESCHED, 1f	// needs rescheduling?
 	bl	el1_preempt
 1:
@@ -529,9 +591,46 @@ ENDPROC(el1_irq)
 el1_preempt:
 	mov	x24, lr
 1:	bl	preempt_schedule_irq		// irq en/disable is done inside
-	ldr	x0, [tsk, #TI_FLAGS]		// get new tasks TI_FLAGS
+	ldr	x0, [tsk, #TSK_TI_FLAGS]	// get new tasks TI_FLAGS
 	tbnz	x0, #TIF_NEED_RESCHED, 1b	// needs rescheduling?
 	ret	x24
+#endif
+
+el1_serr:
+	kernel_entry 1
+	enable_dbg
+1:
+	mrs	x0, daif
+	mrs	x1, spsr_el1
+	mov	x2, sp				// struct pt_regs
+	bl	handle_serr
+	kernel_exit 1
+ENDPROC(el1_serr)
+
+el0_serr:
+	kernel_entry 0
+	ct_user_exit
+	enable_dbg
+	mrs	x0, daif
+	mrs	x1, spsr_el1
+	mov	x2, sp
+	bl	handle_serr
+	enable_da_f
+	b	ret_to_user
+ENDPROC(el0_serr)
+
+#ifdef CONFIG_COMPAT
+el0_serr_compat:
+	kernel_entry 0, 32
+	ct_user_exit
+	enable_dbg
+	mrs     x0, daif
+	mrs     x1, spsr_el1
+	mov     x2, sp
+	bl      handle_serr
+	enable_da_f
+	b       ret_to_user
+ENDPROC(el0_serr_compat)
 #endif
 
 /*
@@ -726,12 +825,12 @@ el0_irq_naked:
 	bl	trace_hardirqs_off
 #endif
 
-	ct_user_exit
 #ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
-	tbz	x22, #55, 1f
-	bl	do_el0_irq_bp_hardening
+       tbz     x22, #55, 1f
+       bl      do_el0_irq_bp_hardening
 1:
 #endif
+	ct_user_exit
 	irq_handler
 
 #ifdef CONFIG_TRACE_IRQFLAGS
@@ -768,8 +867,7 @@ ENTRY(cpu_switch_to)
 	ldp	x29, x9, [x8], #16
 	ldr	lr, [x8]
 	mov	sp, x9
-	and	x9, x9, #~(THREAD_SIZE - 1)
-	msr	sp_el0, x9
+	msr	sp_el0, x1
 	ret
 ENDPROC(cpu_switch_to)
 
@@ -780,7 +878,7 @@ ENDPROC(cpu_switch_to)
 ret_fast_syscall:
 	disable_irq				// disable interrupts
 	str	x0, [sp, #S_X0]			// returned x0
-	ldr	x1, [tsk, #TI_FLAGS]		// re-check for syscall tracing
+	ldr	x1, [tsk, #TSK_TI_FLAGS]	// re-check for syscall tracing
 	and	x2, x1, #_TIF_SYSCALL_WORK
 	cbnz	x2, ret_fast_syscall_trace
 	and	x2, x1, #_TIF_WORK_MASK
@@ -800,14 +898,14 @@ work_pending:
 #ifdef CONFIG_TRACE_IRQFLAGS
 	bl	trace_hardirqs_on		// enabled while in userspace
 #endif
-	ldr	x1, [tsk, #TI_FLAGS]		// re-check for single-step
+	ldr	x1, [tsk, #TSK_TI_FLAGS]	// re-check for single-step
 	b	finish_ret_to_user
 /*
  * "slow" syscall return path.
  */
 ret_to_user:
 	disable_irq				// disable interrupts
-	ldr	x1, [tsk, #TI_FLAGS]
+	ldr	x1, [tsk, #TSK_TI_FLAGS]
 	and	x2, x1, #_TIF_WORK_MASK
 	cbnz	x2, work_pending
 finish_ret_to_user:
@@ -840,7 +938,7 @@ el0_svc_naked:					// compat entry point
 	enable_dbg_and_irq
 	ct_user_exit 1
 
-	ldr	x16, [tsk, #TI_FLAGS]		// check for syscall hooks
+	ldr	x16, [tsk, #TSK_TI_FLAGS]	// check for syscall hooks
 	tst	x16, #_TIF_SYSCALL_WORK
 	b.ne	__sys_trace
 	cmp     scno, sc_nr                     // check upper syscall limit
@@ -897,14 +995,24 @@ __ni_sys_trace:
 	// Move from tramp_pg_dir to swapper_pg_dir
 	.macro tramp_map_kernel, tmp
 	mrs	\tmp, ttbr1_el1
-	sub	\tmp, \tmp, #SWAPPER_DIR_SIZE
+	sub	\tmp, \tmp, #(SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE)
 	bic	\tmp, \tmp, #USER_ASID_FLAG
 	msr	ttbr1_el1, \tmp
+#ifdef CONFIG_ARCH_MSM8996
+	/* ASID already in \tmp[63:48] */
+	movk	\tmp, #:abs_g2_nc:(TRAMP_VALIAS >> 12)
+	movk	\tmp, #:abs_g1_nc:(TRAMP_VALIAS >> 12)
+	/* 2MB boundary containing the vectors, so we nobble the walk cache */
+	movk	\tmp, #:abs_g0_nc:((TRAMP_VALIAS & ~(SZ_2M - 1)) >> 12)
+	isb
+	tlbi	vae1, \tmp
+	dsb	nsh
+#endif /* CONFIG_ARCH_MSM8996 */
 	.endm
 
 	.macro tramp_unmap_kernel, tmp
 	mrs	\tmp, ttbr1_el1
-	add	\tmp, \tmp, #SWAPPER_DIR_SIZE
+	add	\tmp, \tmp, #(SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE)
 	orr	\tmp, \tmp, #USER_ASID_FLAG
 	msr	ttbr1_el1, \tmp
 	/*
@@ -923,6 +1031,9 @@ __ni_sys_trace:
 #ifdef CONFIG_RANDOMIZE_BASE
 	tramp_data_page		\dst
 	add	\dst, \dst, #:lo12:__entry_tramp_data_\var
+#ifndef CONFIG_ARCH_MSM8996
+	isb
+#endif
 	ldr	\dst, [\dst]
 #else
 	ldr	\dst, =\var
@@ -1004,6 +1115,8 @@ alternative_endif
 	.endif
 	add	sp, sp, #S_FRAME_SIZE		// restore sp
 	eret
+	dsb nsh
+	isb
 	.endm
 
 	.macro	generate_tramp_vector,	kpti, bhb

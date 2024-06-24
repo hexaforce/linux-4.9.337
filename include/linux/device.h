@@ -277,6 +277,7 @@ struct device_driver {
 	int (*probe) (struct device *dev);
 	int (*remove) (struct device *dev);
 	void (*shutdown) (struct device *dev);
+	void (*late_shutdown) (struct device *dev);
 	int (*suspend) (struct device *dev, pm_message_t state);
 	int (*resume) (struct device *dev);
 	const struct attribute_group **groups;
@@ -294,6 +295,7 @@ extern struct device_driver *driver_find(const char *name,
 					 struct bus_type *bus);
 extern int driver_probe_done(void);
 extern void wait_for_device_probe(void);
+extern void device_unblock_probing(void);
 
 
 /* sysfs interface for exporting driver attributes */
@@ -857,8 +859,18 @@ struct device {
 	struct iommu_group	*iommu_group;
 	struct iommu_fwspec	*iommu_fwspec;
 
+	/* dma-buf stashing is optimized for host1x context device. Adding
+	 * flag to find out whether device is context device or not.
+	 * To iterate over all dma-bufs attached to dev for stashing, we need
+	 * dev to dma-buf mappings list stored in dev node, adding attachments
+	 * for that purpose.
+	 */
+	bool			context_dev;
+	struct list_head	attachments;
+
 	bool			offline_disabled:1;
 	bool			offline:1;
+	bool			no_dmabuf_defer_unmap:1;
 };
 
 static inline struct device *kobj_to_dev(struct kobject *kobj)

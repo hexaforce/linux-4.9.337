@@ -9,10 +9,12 @@
 #include <linux/rmap.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#include <linux/dma-contiguous.h>
 
 #include <linux/sched.h>
 #include <linux/rwsem.h>
 #include <linux/hugetlb.h>
+#include <linux/migrate.h>
 
 #include <asm/mmu_context.h>
 #include <asm/pgtable.h>
@@ -35,6 +37,8 @@ static struct page *no_page_table(struct vm_area_struct *vma,
 		return ERR_PTR(-EFAULT);
 	return NULL;
 }
+
+#define FOLL_CMA 0x10000000
 
 static int follow_pfn_pte(struct vm_area_struct *vma, unsigned long address,
 		pte_t *pte, unsigned int flags)
@@ -87,6 +91,7 @@ static struct page *follow_page_pte(struct vm_area_struct *vma,
 	struct page *page;
 	spinlock_t *ptl;
 	pte_t *ptep, pte;
+	bool replace_page = false;
 
 retry:
 	if (unlikely(pmd_bad(*pmd)))
@@ -161,7 +166,14 @@ retry:
 		goto retry;
 	}
 
-	if (flags & FOLL_GET) {
+	if ((flags & FOLL_CMA) && (flags & FOLL_GET) &&
+		dma_contiguous_should_replace_page(page)) {
+		/*
+		 * Don't get ref on page.
+		 * Let __get_user_pages replace the CMA page with non-CMA.
+		 */
+		replace_page = true;
+	} else if (flags & FOLL_GET) {
 		if (unlikely(!try_get_page(page))) {
 			page = ERR_PTR(-ENOMEM);
 			goto out;
@@ -212,6 +224,8 @@ retry:
 	}
 out:
 	pte_unmap_unlock(ptep, ptl);
+	if (replace_page && !IS_ERR(page))
+		return (struct page *)((ulong)page + 1);
 	return page;
 no_page:
 	pte_unmap_unlock(ptep, ptl);
@@ -362,6 +376,17 @@ static int get_gate_page(struct mm_struct *mm, unsigned long address,
 		if ((gup_flags & FOLL_DUMP) || !is_zero_pfn(pte_pfn(*pte)))
 			goto unmap;
 		*page = pte_page(*pte);
+
+		/*
+		 * This should never happen (a device public page in the gate
+		 * area).
+		 */
+		if (is_device_public_page(*page))
+			goto unmap;
+	}
+	if (unlikely(!try_get_page(*page))) {
+		ret = -ENOMEM;
+		goto unmap;
 	}
 	if (unlikely(!try_get_page(*page))) {
 		ret = -ENOMEM;
@@ -487,6 +512,46 @@ static int check_vma_flags(struct vm_area_struct *vma, unsigned long gup_flags)
 }
 
 /**
+ * replace_cma_page() - migrate page out of CMA page blocks
+ * @page:	source page to be migrated
+ *
+ * Returns either the old page (if migration was not possible) or the pointer
+ * to the newly allocated page (with additional reference taken).
+ *
+ * get_user_pages() might take a reference to a page for a long period of time,
+ * what prevent such page from migration. This is fatal to the preffered usage
+ * pattern of CMA pageblocks. This function replaces the given user page with
+ * a new one allocated from NON-MOVABLE pageblock, so locking CMA page can be
+ * avoided.
+ */
+static inline struct page *migrate_replace_cma_page(struct page *page)
+{
+	struct page *newpage = alloc_page(GFP_HIGHUSER);
+
+	if (!newpage)
+		goto out;
+
+	/*
+	 * Take additional reference to the new page to ensure it won't get
+	 * freed after migration procedure end.
+	 */
+	get_page(newpage);
+	if (migrate_replace_page(page, newpage) == 0) {
+		put_page(newpage);
+		return newpage;
+	}
+
+	put_page(newpage);
+	__free_page(newpage);
+out:
+	/*
+	 * Migration errors in case of get_user_pages() might not
+	 * be fatal to CMA itself, so better don't fail here.
+	 */
+	return page;
+}
+
+/**
  * __get_user_pages() - pin user pages in memory
  * @tsk:	task_struct of target task
  * @mm:		mm_struct of target mm
@@ -568,6 +633,7 @@ static long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		struct page *page;
 		unsigned int foll_flags = gup_flags;
 		unsigned int page_increm;
+		static DEFINE_MUTEX(s_follow_page_lock);
 
 		/* first iteration or cross vma bound */
 		if (!vma || start >= vma->vm_end) {
@@ -606,7 +672,8 @@ retry:
 		if (unlikely(fatal_signal_pending(current)))
 			return i ? i : -ERESTARTSYS;
 		cond_resched();
-		page = follow_page_mask(vma, start, foll_flags, &page_mask);
+		page = follow_page_mask(vma, start,
+				foll_flags | FOLL_CMA, &page_mask);
 		if (!page) {
 			int ret;
 			ret = faultin_page(tsk, vma, start, &foll_flags,
@@ -633,6 +700,51 @@ retry:
 		} else if (IS_ERR(page)) {
 			return i ? i : PTR_ERR(page);
 		}
+
+		/* Page would have lsb set when CMA page need replacement. */
+		if (((ulong)page & 0x1) == 0x1) {
+			struct page *old_page;
+			unsigned int fault_flags = 0;
+
+			mutex_lock(&s_follow_page_lock);
+			page = (struct page *)((ulong)page & ~0x1);
+			old_page = page;
+			wait_on_page_locked_timeout(page);
+			page = migrate_replace_cma_page(page);
+			/* migration might be successful. vma mapping
+			 * might have changed if there had been a write
+			 * fault from other accesses before migration
+			 * code locked the page. Follow the page again
+			 * to get the latest mapping. If migration was
+			 * successful, follow again would get
+			 * non-CMA page. If there had been a write
+			 * page fault, follow page and CMA page
+			 * replacement(if necessary) would restart with
+			 * new page.
+			 */
+			if (page == old_page)
+				wait_on_page_locked_timeout(page);
+			if (foll_flags & FOLL_WRITE) {
+				/* page would be marked as old during
+				 * migration. To make it young, call
+				 * handle_mm_fault.
+				 * This to avoid the sanity check
+				 * failures in the calling code, which
+				 * check for pte write permission
+				 * bits.
+				 */
+				fault_flags |= FAULT_FLAG_WRITE;
+				handle_mm_fault(vma,
+					start, fault_flags);
+			}
+			foll_flags = gup_flags;
+			mutex_unlock(&s_follow_page_lock);
+			goto retry;
+		}
+
+		BUG_ON(dma_contiguous_should_replace_page(page) &&
+			(foll_flags & FOLL_GET));
+
 		if (pages) {
 			pages[i] = page;
 			flush_anon_page(vma, page, start);

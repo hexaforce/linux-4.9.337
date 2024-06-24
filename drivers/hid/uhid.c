@@ -31,6 +31,8 @@
 #define UHID_NAME	"uhid"
 #define UHID_BUFSIZE	32
 
+static DEFINE_MUTEX(uhid_open_mutex);
+
 struct uhid_device {
 	struct mutex devlock;
 
@@ -165,15 +167,26 @@ static void uhid_hid_stop(struct hid_device *hid)
 static int uhid_hid_open(struct hid_device *hid)
 {
 	struct uhid_device *uhid = hid->driver_data;
+	int retval = 0;
 
-	return uhid_queue_event(uhid, UHID_OPEN);
+	mutex_lock(&uhid_open_mutex);
+	if (!hid->open++) {
+		retval = uhid_queue_event(uhid, UHID_OPEN);
+		if (retval)
+			hid->open--;
+	}
+	mutex_unlock(&uhid_open_mutex);
+	return retval;
 }
 
 static void uhid_hid_close(struct hid_device *hid)
 {
 	struct uhid_device *uhid = hid->driver_data;
 
-	uhid_queue_event(uhid, UHID_CLOSE);
+	mutex_lock(&uhid_open_mutex);
+	if (!--hid->open)
+		uhid_queue_event(uhid, UHID_CLOSE);
+	mutex_unlock(&uhid_open_mutex);
 }
 
 static int uhid_hid_parse(struct hid_device *hid)
@@ -348,7 +361,7 @@ static int uhid_hid_raw_request(struct hid_device *hid, unsigned char reportnum,
 	}
 }
 
-static int uhid_hid_output_raw(struct hid_device *hid, __u8 *buf, size_t count,
+int uhid_hid_output_raw(struct hid_device *hid, __u8 *buf, size_t count,
 			       unsigned char report_type)
 {
 	struct uhid_device *uhid = hid->driver_data;
@@ -385,6 +398,7 @@ static int uhid_hid_output_raw(struct hid_device *hid, __u8 *buf, size_t count,
 
 	return count;
 }
+EXPORT_SYMBOL_GPL(uhid_hid_output_raw);
 
 static int uhid_hid_output_report(struct hid_device *hid, __u8 *buf,
 				  size_t count)
@@ -495,7 +509,7 @@ static int uhid_dev_create2(struct uhid_device *uhid,
 			    const struct uhid_event *ev)
 {
 	struct hid_device *hid;
-	size_t rd_size, len;
+	size_t rd_size;
 	void *rd_data;
 	int ret;
 
@@ -519,12 +533,9 @@ static int uhid_dev_create2(struct uhid_device *uhid,
 		goto err_free;
 	}
 
-	len = min(sizeof(hid->name), sizeof(ev->u.create2.name)) - 1;
-	strncpy(hid->name, ev->u.create2.name, len);
-	len = min(sizeof(hid->phys), sizeof(ev->u.create2.phys)) - 1;
-	strncpy(hid->phys, ev->u.create2.phys, len);
-	len = min(sizeof(hid->uniq), sizeof(ev->u.create2.uniq)) - 1;
-	strncpy(hid->uniq, ev->u.create2.uniq, len);
+	strlcpy(hid->name, ev->u.create2.name, sizeof(hid->name));
+	strlcpy(hid->phys, ev->u.create2.phys, sizeof(hid->phys));
+	strlcpy(hid->uniq, ev->u.create2.uniq, sizeof(hid->uniq));
 
 	hid->ll_driver = &uhid_hid_driver;
 	hid->bus = ev->u.create2.bus;

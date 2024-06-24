@@ -541,7 +541,7 @@ struct kset *devices_kset;
  */
 static void devices_kset_move_before(struct device *deva, struct device *devb)
 {
-	if (!devices_kset)
+	if (!devices_kset || !deva || !devb)
 		return;
 	pr_debug("devices_kset: Moving %s before %s\n",
 		 dev_name(deva), dev_name(devb));
@@ -557,7 +557,7 @@ static void devices_kset_move_before(struct device *deva, struct device *devb)
  */
 static void devices_kset_move_after(struct device *deva, struct device *devb)
 {
-	if (!devices_kset)
+	if (!devices_kset || !deva || !devb)
 		return;
 	pr_debug("devices_kset: Moving %s after %s\n",
 		 dev_name(deva), dev_name(devb));
@@ -707,12 +707,16 @@ void device_initialize(struct device *dev)
 	lockdep_set_novalidate_class(&dev->mutex);
 	spin_lock_init(&dev->devres_lock);
 	INIT_LIST_HEAD(&dev->devres_head);
+	INIT_LIST_HEAD(&dev->attachments);
+
 	device_pm_init(dev);
 	set_dev_node(dev, -1);
 #ifdef CONFIG_GENERIC_MSI_IRQ
 	raw_spin_lock_init(&dev->msi_lock);
 	INIT_LIST_HEAD(&dev->msi_list);
 #endif
+	dev->no_dmabuf_defer_unmap = 0;
+	dev->context_dev = false;
 }
 EXPORT_SYMBOL_GPL(device_initialize);
 
@@ -2120,6 +2124,7 @@ out:
 }
 EXPORT_SYMBOL_GPL(device_move);
 
+static LIST_HEAD(shutdown_list);
 /**
  * device_shutdown - call ->shutdown() on each device to shutdown.
  */
@@ -2177,6 +2182,51 @@ void device_shutdown(void)
 			if (initcall_debug)
 				dev_info(dev, "shutdown\n");
 			dev->driver->shutdown(dev);
+		}
+
+		device_unlock(dev);
+		if (parent)
+			device_unlock(parent);
+
+		if (dev->driver && dev->driver->late_shutdown) {
+			spin_lock(&devices_kset->list_lock);
+			list_add(&dev->kobj.entry, &shutdown_list);
+			spin_unlock(&devices_kset->list_lock);
+		}
+		put_device(dev);
+		put_device(parent);
+		spin_lock(&devices_kset->list_lock);
+	}
+
+	pr_info("late_shutdown started\n");
+
+	while (!list_empty(&shutdown_list)) {
+		dev = list_entry(shutdown_list.prev, struct device,
+				kobj.entry);
+
+		/*
+		 * hold reference count of device's parent to
+		 * prevent it from being freed because parent's
+		 * lock is to be held
+		 */
+		parent = get_device(dev->parent);
+		get_device(dev);
+		/*
+		 * Make sure the device is off the kset list, in the
+		 * event that dev->*->shutdown() doesn't remove it.
+		 */
+		list_del_init(&dev->kobj.entry);
+		spin_unlock(&devices_kset->list_lock);
+
+		/* hold lock to avoid race with probe/release */
+		if (parent)
+			device_lock(parent);
+		device_lock(dev);
+
+		if (dev->driver && dev->driver->late_shutdown) {
+			if (initcall_debug)
+				dev_info(dev, "late_shutdown\n");
+			dev->driver->late_shutdown(dev);
 		}
 
 		device_unlock(dev);

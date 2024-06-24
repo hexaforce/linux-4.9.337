@@ -4,6 +4,7 @@
  *  Copyright (C) 2004 ARM Limited.
  *  Written by Deep Blue Solutions Limited.
  *  Copyright (C) 2011-2012 Linaro Ltd <mturquette@linaro.org>
+ *  Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -37,10 +38,33 @@ struct clk;
  * POST_RATE_CHANGE - called after the clk rate change has successfully
  *     completed.  Callbacks must always return NOTIFY_DONE or NOTIFY_OK.
  *
+ * PRE_SUBTREE_UPDATE - called before rate change is propagated down to
+ *     sub-tree rooted in clk. Callbacks must always return NOTIFY_DONE
+ *     or NOTIFY_OK.
+ *
+ * POST_SUBTREE_UPDATE - called after rate change is propagated down to
+ *     sub-tree rooted in clk. Callbacks must always return NOTIFY_DONE
+ *     or NOTIFY_OK.
+ *
+ * PRE_PARENT_CHANGE - called immediately before the clk parent is changed,
+ *     to indicate that the parent change will proceed. Callbacks may either
+ *     return NOTIFY_DONE, NOTIFY_OK, NOTIFY_STOP or NOTIFY_BAD.
+ *
+ * ABORT_PARENT_CHANGE: called if the parent change failed for some reason
+ *     after PRE_PARENT_CHANGE. Callbacks must always return NOTIFY_DONE or
+ *     NOTIFY_OK.
+ *
+ * POST_PARENT_CHANGE - called after the clk parent change has successfully
+ *     completed.  Callbacks must always return NOTIFY_DONE or NOTIFY_OK.
  */
 #define PRE_RATE_CHANGE			BIT(0)
 #define POST_RATE_CHANGE		BIT(1)
 #define ABORT_RATE_CHANGE		BIT(2)
+#define PRE_SUBTREE_CHANGE		BIT(3)
+#define POST_SUBTREE_CHANGE		BIT(4)
+#define PRE_PARENT_CHANGE		BIT(5)
+#define POST_PARENT_CHANGE		BIT(6)
+#define ABORT_PARENT_CHANGE		BIT(7)
 
 /**
  * struct clk_notifier - associate a clk with a notifier
@@ -284,6 +308,15 @@ void clk_disable(struct clk *clk);
 unsigned long clk_get_rate(struct clk *clk);
 
 /**
+ * clk_get_rate_cached_no_dvfs - obtain the current clock rate (in Hz)
+ *		  for a clock source. This is only valid once the clock
+ *		  source has been enabled. To be used only if known that
+ *		  the clk has no dvfs.
+ * @clk: clock source
+ */
+unsigned long clk_get_rate_cached_no_dvfs(struct clk *clk);
+
+/**
  * clk_put	- "free" the clock source
  * @clk: clock source
  *
@@ -377,13 +410,33 @@ int clk_set_rate_range(struct clk *clk, unsigned long min, unsigned long max);
 int clk_set_min_rate(struct clk *clk, unsigned long rate);
 
 /**
- * clk_set_max_rate - set a maximum clock rate for a clock source
+ * clk_set_max_rate - set a maximum clock rate for a clock source;
  * @clk: clock source
  * @rate: desired maximum clock rate in Hz, inclusive
  *
  * Returns success (0) or negative errno.
  */
 int clk_set_max_rate(struct clk *clk, unsigned long rate);
+
+/**
+ * clk_set_rate_nocache - set a clock rate regardless of the cached rate
+ *
+ * @clk: clock source
+ * @rate: desired maximum clock rate in Hz, inclusive
+ *
+ * Returns success (0) or negative errno.
+ */
+int clk_set_rate_nocache(struct clk *clk, unsigned long rate);
+
+/**
+ * clk_set_rate_refresh - re-set a clocks rate, including triggering any
+ *                        notifiers.
+ *
+ * @clk: clock source
+ *
+ * Returns success (0) or negative errno.
+ */
+int clk_set_rate_refresh(struct clk *clk);
 
 /**
  * clk_set_parent - set the parent clock source for this clock

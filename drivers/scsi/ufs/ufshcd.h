@@ -4,6 +4,7 @@
  * This code is based on drivers/scsi/ufs/ufshcd.h
  * Copyright (C) 2011-2013 Samsung India Software Operations
  * Copyright (c) 2013-2016, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015-2022, NVIDIA CORPORATION.  All rights reserved.
  *
  * Authors:
  *	Santosh Yaraganavi <santosh.sy@samsung.com>
@@ -258,6 +259,7 @@ struct ufs_pwr_mode_info {
  * struct ufs_hba_variant_ops - variant specific callbacks
  * @name: variant name
  * @init: called when the driver is initialized
+ * @late_init: called when the driver has initialized
  * @exit: called to cleanup everything done in init
  * @get_ufs_hci_version: called to get UFS HCI version
  * @clk_scale_notify: notifies that clks are scaled up/down
@@ -279,16 +281,20 @@ struct ufs_pwr_mode_info {
 struct ufs_hba_variant_ops {
 	const char *name;
 	int	(*init)(struct ufs_hba *);
+	int     (*late_init)(struct ufs_hba *);
 	void    (*exit)(struct ufs_hba *);
 	u32	(*get_ufs_hci_version)(struct ufs_hba *);
 	int	(*clk_scale_notify)(struct ufs_hba *, bool,
 				    enum ufs_notify_change_status);
 	int	(*setup_clocks)(struct ufs_hba *, bool);
 	int     (*setup_regulators)(struct ufs_hba *, bool);
+	void	(*hce_disable_notify)(struct ufs_hba *,
+				     enum ufs_notify_change_status);
 	int	(*hce_enable_notify)(struct ufs_hba *,
 				     enum ufs_notify_change_status);
 	int	(*link_startup_notify)(struct ufs_hba *,
 				       enum ufs_notify_change_status);
+	void	(*hibern8_entry_notify)(struct ufs_hba *);
 	int	(*pwr_change_notify)(struct ufs_hba *,
 					enum ufs_notify_change_status status,
 					struct ufs_pa_layer_attr *,
@@ -298,6 +304,7 @@ struct ufs_hba_variant_ops {
 	int     (*resume)(struct ufs_hba *, enum ufs_pm_op);
 	void	(*dbg_register_dump)(struct ufs_hba *hba);
 	int	(*phy_initialization)(struct ufs_hba *);
+	int	(*set_ufs_mphy_clocks)(struct ufs_hba *, bool);
 };
 
 /* clock gating state  */
@@ -343,9 +350,11 @@ struct ufs_clk_scaling {
  * struct ufs_init_prefetch - contains data that is pre-fetched once during
  * initialization
  * @icc_level: icc level which was read during initialization
+ * @ref_clk_freq: ref clk freq which was read during initialization
  */
 struct ufs_init_prefetch {
 	u32 icc_level;
+	u32 ref_clk_freq;
 };
 
 /**
@@ -492,6 +501,16 @@ struct ufs_hba {
 	 */
 	#define UFSHCD_QUIRK_PRDT_BYTE_GRAN			UFS_BIT(7)
 
+	/*
+	 * This quirk needs to be enabled if BKOPS feature has to be enabled
+	 */
+	#define UFSHCD_QUIRK_ENABLE_BKOPS			UFS_BIT(8)
+
+	/*
+	 * Enable this quirk to support UFS WLUNS
+	 */
+	#define UFSHCD_QUIRK_ENABLE_WLUNS			UFS_BIT(9)
+
 	unsigned int quirks;	/* Deviations from standard UFSHCI spec. */
 
 	/* Device deviations from standard UFS device spec. */
@@ -575,6 +594,13 @@ struct ufs_hba {
 	bool is_urgent_bkops_lvl_checked;
 
 	struct ufs_desc_size desc_size;
+
+	int latency_hist_enabled;
+	bool card_present;
+	struct io_latency_state io_lat_read;
+	struct io_latency_state io_lat_write;
+	unsigned card_enumerated:1;
+	struct mutex hotplug_lock;
 };
 
 /* Returns true if clocks can be gated. Otherwise false */
@@ -631,7 +657,7 @@ static inline void ufshcd_rmwl(struct ufs_hba *hba, u32 mask, u32 val, u32 reg)
 	ufshcd_writel(hba, tmp, reg);
 }
 
-int ufshcd_alloc_host(struct device *, struct ufs_hba **);
+int ufshcd_alloc_host(struct ufs_hba *);
 void ufshcd_dealloc_host(struct ufs_hba *);
 int ufshcd_init(struct ufs_hba * , void __iomem * , unsigned int);
 void ufshcd_remove(struct ufs_hba *);
@@ -730,6 +756,8 @@ static inline int ufshcd_dme_peer_get(struct ufs_hba *hba,
 
 int ufshcd_read_device_desc(struct ufs_hba *hba, u8 *buf, u32 size);
 
+int ufs_get_device_specversion(struct ufs_hba *hba, u16 *spec);
+
 static inline bool ufshcd_is_hs_mode(struct ufs_pa_layer_attr *pwr_info)
 {
 	return (pwr_info->pwr_rx == FAST_MODE ||
@@ -784,6 +812,14 @@ static inline u32 ufshcd_vops_get_ufs_hci_version(struct ufs_hba *hba)
 	return ufshcd_readl(hba, REG_UFS_VERSION);
 }
 
+static inline int ufshcd_vops_late_init(struct ufs_hba *hba)
+{
+	if (hba->vops && hba->vops->late_init)
+		return hba->vops->late_init(hba);
+
+	return 0;
+}
+
 static inline int ufshcd_vops_clk_scale_notify(struct ufs_hba *hba,
 			bool up, enum ufs_notify_change_status status)
 {
@@ -807,6 +843,13 @@ static inline int ufshcd_vops_setup_regulators(struct ufs_hba *hba, bool status)
 	return 0;
 }
 
+static inline void ufshcd_vops_hce_disable_notify(struct ufs_hba *hba,
+						bool status)
+{
+	if (hba->vops && hba->vops->hce_disable_notify)
+		hba->vops->hce_disable_notify(hba, status);
+}
+
 static inline int ufshcd_vops_hce_enable_notify(struct ufs_hba *hba,
 						bool status)
 {
@@ -822,6 +865,13 @@ static inline int ufshcd_vops_link_startup_notify(struct ufs_hba *hba,
 		return hba->vops->link_startup_notify(hba, status);
 
 	return 0;
+}
+
+
+static inline void ufshcd_vops_hibern8_entry_notify(struct ufs_hba *hba)
+{
+	if (hba->vops && hba->vops->hibern8_entry_notify)
+		hba->vops->hibern8_entry_notify(hba);
 }
 
 static inline int ufshcd_vops_pwr_change_notify(struct ufs_hba *hba,
@@ -865,4 +915,11 @@ static inline void ufshcd_vops_dbg_register_dump(struct ufs_hba *hba)
 		hba->vops->dbg_register_dump(hba);
 }
 
+int ufshcd_get_refclk_value(struct ufs_hba *hba, u32 *value);
+int ufshcd_set_refclk_value(struct ufs_hba *hba, u32 *value);
+int ufshcd_get_bootlun_en_value(struct ufs_hba *hba, u32 *value);
+int ufshcd_set_bootlun_en_value(struct ufs_hba *hba, u32 *value);
+int ufshcd_get_config_desc_lock(struct ufs_hba *hba, u32 *value);
+int ufshcd_set_config_desc(struct ufs_hba *hba, u8 *desc_buf);
+int ufshcd_get_dev_pwr_mode_value(struct ufs_hba *hba, u32 *value);
 #endif /* End of Header */

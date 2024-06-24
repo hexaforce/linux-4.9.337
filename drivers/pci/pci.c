@@ -58,6 +58,7 @@ struct pci_pme_device {
 };
 
 #define PME_TIMEOUT 1000 /* How long between PME checks */
+#define CRS_TIMEOUT (60 * 1000) /* Configuration Request Retry timeout */
 
 static void pci_dev_d3_sleep(struct pci_dev *dev)
 {
@@ -89,6 +90,7 @@ unsigned long pci_hotplug_mem_size = DEFAULT_HOTPLUG_MEM_SIZE;
 unsigned long pci_hotplug_bus_size = DEFAULT_HOTPLUG_BUS_SIZE;
 
 enum pcie_bus_config_types pcie_bus_config = PCIE_BUS_DEFAULT;
+EXPORT_SYMBOL(pcie_bus_config);
 
 /*
  * The default CLS is used if arch didn't set CLS explicitly and not
@@ -1086,6 +1088,44 @@ static void pci_restore_pcix_state(struct pci_dev *dev)
 	pci_write_config_word(dev, pos + PCI_X_CMD, cap[i++]);
 }
 
+static int pci_save_l1_pm_ss_state(struct pci_dev *dev)
+{
+	int pos;
+	struct pci_cap_saved_state *save_state;
+
+	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_L1SS);
+	if (pos <= 0)
+		return 0;
+
+	save_state = pci_find_saved_ext_cap(dev, PCI_EXT_CAP_ID_L1SS);
+	if (!save_state) {
+		dev_err(&dev->dev, "buffer not found in %s\n", __func__);
+		return -ENOMEM;
+	}
+
+	pci_read_config_dword(dev, pos + PCI_L1SS_CTRL1,
+		&save_state->cap.data[0]);
+	pci_read_config_dword(dev, pos + PCI_L1SS_CTRL2,
+		&save_state->cap.data[1]);
+
+	return 0;
+}
+
+static void pci_restore_l1_pm_ss_state(struct pci_dev *dev)
+{
+	int pos;
+	struct pci_cap_saved_state *save_state;
+
+	save_state = pci_find_saved_ext_cap(dev, PCI_EXT_CAP_ID_L1SS);
+	pos = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_L1SS);
+	if (!save_state || pos <= 0)
+		return;
+
+	pci_write_config_dword(dev, pos + PCI_L1SS_CTRL1,
+		save_state->cap.data[0]);
+	pci_write_config_dword(dev, pos + PCI_L1SS_CTRL2,
+		save_state->cap.data[1]);
+}
 
 /**
  * pci_save_state - save the PCI configuration space of a device before suspending
@@ -1104,6 +1144,10 @@ int pci_save_state(struct pci_dev *dev)
 		return i;
 
 	i = pci_save_pcix_state(dev);
+	if (i != 0)
+		return i;
+
+	i = pci_save_l1_pm_ss_state(dev);
 	if (i != 0)
 		return i;
 
@@ -1188,7 +1232,11 @@ void pci_restore_state(struct pci_dev *dev)
 	pci_restore_config_space(dev);
 
 	pci_restore_pcix_state(dev);
+	pci_restore_l1_pm_ss_state(dev);
 	pci_restore_msi_state(dev);
+#ifdef CONFIG_PCIEAER
+	pci_restore_aer_state(dev);
+#endif
 
 	/* Restore ACS and IOV configuration state */
 	pci_enable_acs(dev);
@@ -2731,6 +2779,12 @@ void pci_allocate_cap_save_buffers(struct pci_dev *dev)
 		dev_err(&dev->dev,
 			"unable to preallocate PCI-X save buffer\n");
 
+	error = pci_add_ext_cap_save_buffer(dev, PCI_EXT_CAP_ID_L1SS,
+		2 * sizeof(u32));
+	if (error)
+		dev_err(&dev->dev,
+			"unable to preallocate L1 PM-SS save buffer\n");
+
 	pci_allocate_vc_save_buffers(dev);
 }
 
@@ -3408,6 +3462,7 @@ int __weak pci_remap_iospace(const struct resource *res, phys_addr_t phys_addr)
 	return -ENODEV;
 #endif
 }
+EXPORT_SYMBOL(pci_remap_iospace);
 
 /**
  *	pci_unmap_iospace - Unmap the memory mapped I/O space
@@ -3425,6 +3480,7 @@ void pci_unmap_iospace(struct resource *res)
 	unmap_kernel_range(vaddr, resource_size(res));
 #endif
 }
+EXPORT_SYMBOL(pci_unmap_iospace);
 
 static void devm_pci_unmap_iospace(struct device *dev, void *ptr)
 {
@@ -3463,6 +3519,36 @@ int devm_pci_remap_iospace(struct device *dev, const struct resource *res,
 	return error;
 }
 EXPORT_SYMBOL(devm_pci_remap_iospace);
+
+/**
+ * devm_pci_remap_cfgspace - Managed pci_remap_cfgspace()
+ * @dev: Generic device to remap IO address for
+ * @offset: Resource address to map
+ * @size: Size of map
+ *
+ * Managed pci_remap_cfgspace().  Map is automatically unmapped on driver
+ * detach.
+ */
+void __iomem *devm_pci_remap_cfgspace(struct device *dev,
+				      resource_size_t offset,
+				      resource_size_t size)
+{
+	void __iomem **ptr, *addr;
+
+	ptr = devres_alloc(devm_ioremap_release, sizeof(*ptr), GFP_KERNEL);
+	if (!ptr)
+		return NULL;
+
+	addr = pci_remap_cfgspace(offset, size);
+	if (addr) {
+		*ptr = addr;
+		devres_add(dev, ptr);
+	} else
+		devres_free(ptr);
+
+	return addr;
+}
+EXPORT_SYMBOL(devm_pci_remap_cfgspace);
 
 static void __pci_set_master(struct pci_dev *dev, bool enable)
 {
@@ -5021,7 +5107,8 @@ bool pci_device_is_present(struct pci_dev *pdev)
 {
 	u32 v;
 
-	return pci_bus_read_dev_vendor_id(pdev->bus, pdev->devfn, &v, 0);
+	return pci_bus_read_dev_vendor_id(pdev->bus, pdev->devfn, &v,
+					  CRS_TIMEOUT);
 }
 EXPORT_SYMBOL_GPL(pci_device_is_present);
 
@@ -5116,7 +5203,7 @@ static resource_size_t pci_specified_resource_alignment(struct pci_dev *dev)
 				if (align_order == -1)
 					align = PAGE_SIZE;
 				else
-					align = 1 << align_order;
+					align = (resource_size_t)1 << align_order;
 				/* Found */
 				break;
 			}

@@ -115,7 +115,7 @@ static ssize_t hidraw_send_report(struct file *file, const char __user *buffer, 
 	unsigned int minor = iminor(file_inode(file));
 	struct hid_device *dev;
 	__u8 *buf;
-	int ret = 0;
+	long ret = 0;
 
 	if (!hidraw_table[minor] || !hidraw_table[minor]->exist) {
 		ret = -ENODEV;
@@ -500,6 +500,7 @@ int hidraw_report_event(struct hid_device *hid, u8 *data, int len)
 		if (new_head == list->tail)
 			continue;
 
+		kfree(list->buffer[list->head].value);
 		if (!(list->buffer[list->head].value = kmemdup(data, len, GFP_ATOMIC))) {
 			ret = -ENOMEM;
 			break;

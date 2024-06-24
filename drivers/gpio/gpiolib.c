@@ -1025,8 +1025,6 @@ static int gpio_chrdev_release(struct inode *inode, struct file *filp)
 	struct gpio_device *gdev = container_of(inode->i_cdev,
 					      struct gpio_device, chrdev);
 
-	if (!gdev)
-		return -ENODEV;
 	put_device(&gdev->dev);
 	return 0;
 }
@@ -1079,7 +1077,7 @@ static int gpiochip_setup_dev(struct gpio_device *gdev)
 
 	/* From this point, the .release() function cleans up gpio_device */
 	gdev->dev.release = gpiodevice_release;
-	pr_debug("%s: registered GPIOs %d to %d on device: %s (%s)\n",
+	pr_info("%s: registered GPIOs %d to %d on device: %s (%s)\n",
 		 __func__, gdev->base, gdev->base + gdev->ngpio - 1,
 		 dev_name(&gdev->dev), gdev->chip->label ? : "generic");
 
@@ -1969,6 +1967,7 @@ static int __gpiod_request(struct gpio_desc *desc, const char *label)
 	struct gpio_chip	*chip = desc->gdev->chip;
 	int			status;
 	unsigned long		flags;
+	bool			hogged = false;
 
 	spin_lock_irqsave(&gpio_lock, flags);
 
@@ -1980,11 +1979,18 @@ static int __gpiod_request(struct gpio_desc *desc, const char *label)
 		desc_set_label(desc, label ? : "?");
 		status = 0;
 	} else {
-		status = -EBUSY;
-		goto done;
+		if (test_bit(FLAG_IS_HOGGED, &desc->flags)) {
+			hogged = true;
+			desc_set_label(desc, label ? : "?");
+			clear_bit(FLAG_IS_HOGGED, &desc->flags);
+			status = 0;
+		} else {
+			status = -EBUSY;
+			goto done;
+		}
 	}
 
-	if (chip->request) {
+	if (chip->request && !hogged) {
 		/* chip->request may sleep */
 		spin_unlock_irqrestore(&gpio_lock, flags);
 		status = chip->request(chip, gpio_chip_hwgpio(desc));
@@ -2328,6 +2334,61 @@ int gpiod_direction_output(struct gpio_desc *desc, int value)
 EXPORT_SYMBOL_GPL(gpiod_direction_output);
 
 /**
+ * gpiod_timestamp_control - Enable/Disable timstamping for GPIO
+ * @desc:	GPIO for which to Enable/Disable Timestamp
+ * @enable:	Enable/Disable timestamp
+ *
+ * Enable or Disable timestamping feature for given GPIO
+ *
+ * Return 0 in case of success, else an error code.
+ */
+int gpiod_timestamp_control(struct gpio_desc *desc, int enable)
+{
+	struct gpio_chip *chip;
+
+	VALIDATE_DESC(desc);
+	chip = desc->gdev->chip;
+	if (!chip->timestamp_control) {
+		gpiod_warn(desc, "%s: missing timestamp_control operations\n",
+			  __func__);
+		return -ENOTSUPP;
+	}
+
+	return chip->timestamp_control(chip, gpio_chip_hwgpio(desc), enable);
+}
+EXPORT_SYMBOL_GPL(gpiod_timestamp_control);
+
+/**
+ * gpiod_timestamp_read - Read timstamp value for GPIO
+ * @desc:	GPIO to read timestamp value
+ * @ts:		data where to store the timestamp
+ *
+ * Read timestamp value for given GPIO
+ *
+ * Return 0 in case of success, else an error code.
+ */
+int gpiod_timestamp_read(struct gpio_desc *desc, u64 *ts)
+{
+	struct gpio_chip *chip;
+	u64 gpio_ts;
+	int ret;
+
+	VALIDATE_DESC(desc);
+	chip = desc->gdev->chip;
+	if (!chip->timestamp_read) {
+		gpiod_warn(desc, "%s: missing timestamp_read operations\n",
+			  __func__);
+		return -ENOTSUPP;
+	}
+
+	ret = chip->timestamp_read(chip, gpio_chip_hwgpio(desc), &gpio_ts);
+	*ts = gpio_ts;
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(gpiod_timestamp_read);
+
+/**
  * gpiod_set_debounce - sets @debounce time for a @gpio
  * @gpio: the gpio to set debounce time
  * @debounce: debounce time is microseconds
@@ -2364,6 +2425,31 @@ int gpiod_is_active_low(const struct gpio_desc *desc)
 	return test_bit(FLAG_ACTIVE_LOW, &desc->flags);
 }
 EXPORT_SYMBOL_GPL(gpiod_is_active_low);
+
+/**
+ * gpiod_is_enabled - Test whether a GPIO is enabled or not.
+ * @desc: the gpio descriptor to check.
+ *
+ * Returns 1 if the GPIO is enabled, 0 if not and error if any
+ * failure.
+ */
+int gpiod_is_enabled(const struct gpio_desc *desc)
+{
+	struct gpio_chip *chip = gpiod_to_chip(desc);
+
+	if (!chip) {
+		pr_warn("%s: invalid GPIO\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!chip->is_enabled) {
+		gpiod_dbg(desc, "%s: missing is_enabled() ops\n", __func__);
+		return -ENOTSUPP;
+	}
+
+	return chip->is_enabled(chip, gpio_chip_hwgpio(desc));
+}
+EXPORT_SYMBOL_GPL(gpiod_is_enabled);
 
 /* I/O calls are only valid after configuration completed; the relevant
  * "is this a valid GPIO" error checks should already have been done.
@@ -3278,6 +3364,7 @@ struct gpio_desc *fwnode_get_named_gpiod(struct fwnode_handle *fwnode,
 	struct gpio_desc *desc = ERR_PTR(-ENODEV);
 	bool active_low = false;
 	bool single_ended = false;
+	bool open_drain = false;
 	int ret;
 
 	if (!fwnode)
@@ -3291,6 +3378,7 @@ struct gpio_desc *fwnode_get_named_gpiod(struct fwnode_handle *fwnode,
 		if (!IS_ERR(desc)) {
 			active_low = flags & OF_GPIO_ACTIVE_LOW;
 			single_ended = flags & OF_GPIO_SINGLE_ENDED;
+			open_drain = flags & OF_GPIO_OPEN_DRAIN;
 		}
 	} else if (is_acpi_node(fwnode)) {
 		struct acpi_gpio_info info;
@@ -3311,7 +3399,7 @@ struct gpio_desc *fwnode_get_named_gpiod(struct fwnode_handle *fwnode,
 		set_bit(FLAG_ACTIVE_LOW, &desc->flags);
 
 	if (single_ended) {
-		if (active_low)
+		if (open_drain)
 			set_bit(FLAG_OPEN_DRAIN, &desc->flags);
 		else
 			set_bit(FLAG_OPEN_SOURCE, &desc->flags);

@@ -16,6 +16,7 @@
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/ratelimit.h>
+#include <linux/kthread.h>
 
 
 #define MIN_TTYB_SIZE	256
@@ -118,6 +119,7 @@ void tty_buffer_free_all(struct tty_port *port)
 	struct tty_buffer *p, *next;
 	struct llist_node *llist;
 
+	tty_buffer_stop_rt_thread(port);
 	while ((p = buf->head) != NULL) {
 		buf->head = p->next;
 		if (p->size > 0)
@@ -131,6 +133,7 @@ void tty_buffer_free_all(struct tty_port *port)
 	buf->head = &buf->sentinel;
 	buf->tail = &buf->sentinel;
 
+	atomic_set(&buf->current_data_count, 0);
 	atomic_set(&buf->mem_used, 0);
 }
 
@@ -444,6 +447,30 @@ int tty_ldisc_receive_buf(struct tty_ldisc *ld, unsigned char *p,
 }
 EXPORT_SYMBOL_GPL(tty_ldisc_receive_buf);
 
+int tty_buffer_get_level(struct tty_port *port)
+{
+	struct tty_bufhead *buf = &port->buf;
+	int level_percent = 0;
+	int maximum_size = 65536;
+
+	level_percent = (atomic_read(&buf->current_data_count)
+			* 100) / maximum_size;
+
+	return level_percent;
+}
+EXPORT_SYMBOL(tty_buffer_get_level);
+
+int tty_buffer_get_count(struct tty_port *port)
+{
+	struct tty_bufhead *buf = &port->buf;
+	int level_percent = 0;
+
+	level_percent = atomic_read(&buf->current_data_count);
+
+	return level_percent;
+}
+EXPORT_SYMBOL(tty_buffer_get_count);
+
 static int
 receive_buf(struct tty_ldisc *ld, struct tty_buffer *head, int count)
 {
@@ -490,6 +517,7 @@ static void flush_to_ldisc(struct work_struct *work)
 		struct tty_buffer *head = buf->head;
 		struct tty_buffer *next;
 		int count;
+		int remain_count;
 
 		/* Ldisc or user is trying to gain exclusive access */
 		if (atomic_read(&buf->priority))
@@ -517,6 +545,13 @@ static void flush_to_ldisc(struct work_struct *work)
 			break;
 		head->read += count;
 
+		remain_count = atomic_read(&buf->current_data_count);
+		if (remain_count >= count)
+			atomic_set(&buf->current_data_count,
+				   (remain_count - count));
+		else
+			atomic_set(&buf->current_data_count, 0);
+
 		if (need_resched())
 			cond_resched();
 	}
@@ -536,7 +571,41 @@ static inline void tty_flip_buffer_commit(struct tty_buffer *tail)
 }
 
 /**
- *	tty_flip_buffer_push	-	terminal
+ *	flush_to_ldisc_thread
+ *	@data: tty port to be flushed.
+ *
+ *	Until the thread is stopped call flush_to_ldisc()
+ *	to flush the data for every wakeup from
+ *	tty_schedule_flip() routine.
+ *
+ */
+static int flush_to_ldisc_thread(void *data)
+{
+	struct tty_port *port = data;
+
+	while (!kthread_should_stop()) {
+		flush_to_ldisc(&port->buf.work);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+	}
+	return 0;
+}
+
+/**
+ *	tty_flush_to_ldisc
+ *	@tty: tty to push
+ *
+ *	Push the terminal flip buffers to the line discipline.
+ *
+ *	Must not be called from IRQ context.
+ */
+void tty_flush_to_ldisc(struct tty_struct *tty)
+{
+	flush_work(&tty->port->buf.work);
+}
+
+/**
+ *	tty_flip_buffer_push    -       terminal
  *	@port: tty port to push
  *
  *	Queue a push of the terminal flip buffers to the line discipline.
@@ -607,6 +676,7 @@ void tty_buffer_init(struct tty_port *port)
 	atomic_set(&buf->priority, 0);
 	INIT_WORK(&buf->work, flush_to_ldisc);
 	buf->mem_limit = TTYB_DEFAULT_MEM_LIMIT;
+	atomic_set(&buf->current_data_count, 0);
 }
 
 /**
@@ -646,3 +716,42 @@ void tty_buffer_flush_work(struct tty_port *port)
 {
 	flush_work(&port->buf.work);
 }
+
+static const int tty_kthread_policy = SCHED_FIFO;
+
+static const struct sched_param tty_kthread_param = {
+	.sched_priority = MAX_USER_RT_PRIO - 1,
+};
+
+void tty_buffer_stop_rt_thread(struct tty_port *port)
+{
+	if (!IS_ERR_OR_NULL(port->tty_kthread))
+		kthread_stop(port->tty_kthread);
+	port->tty_kthread = NULL;
+}
+EXPORT_SYMBOL(tty_buffer_stop_rt_thread);
+
+int tty_buffer_start_rt_thread(struct tty_port *port, int id)
+{
+	int ret;
+
+	port->tty_kthread = kthread_create(flush_to_ldisc_thread,
+		port, "tty-rt-thread-%d", id);
+	if (IS_ERR_OR_NULL(port->tty_kthread)) {
+		ret = -EINVAL;
+		goto err;
+	}
+
+	ret = sched_setscheduler(port->tty_kthread, tty_kthread_policy,
+		&tty_kthread_param);
+	if (ret < 0)
+		goto err;
+
+	wake_up_process(port->tty_kthread);
+	return 0;
+
+err:
+	tty_buffer_stop_rt_thread(port);
+	return ret;
+}
+EXPORT_SYMBOL(tty_buffer_start_rt_thread);

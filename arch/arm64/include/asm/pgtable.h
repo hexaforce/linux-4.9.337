@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2012 ARM Ltd.
+ * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -52,7 +53,7 @@ extern void __pgd_error(const char *file, int line, unsigned long val);
  * for zero-mapped memory areas etc..
  */
 extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
-#define ZERO_PAGE(vaddr)	pfn_to_page(PHYS_PFN(__pa(empty_zero_page)))
+#define ZERO_PAGE(vaddr)	phys_to_page(__pa_symbol(empty_zero_page))
 
 #define pte_ERROR(pte)		__pte_error(__FILE__, __LINE__, pte_val(pte))
 
@@ -111,6 +112,12 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 #define pud_access_permitted(pud, write) \
 	(pte_access_permitted(pud_pte(pud), (write)))
 
+#ifdef CONFIG_ARM64_NON_SHARED_TLBI
+#define __DSB_FOR_PGTABLE()	dsb(nshst)
+#else
+#define __DSB_FOR_PGTABLE()	dsb(ishst)
+#endif
+
 static inline pte_t clear_pte_bit(pte_t pte, pgprot_t prot)
 {
 	pte_val(pte) &= ~pgprot_val(prot);
@@ -158,6 +165,8 @@ static inline pte_t pte_mkspecial(pte_t pte)
 	return set_pte_bit(pte, __pgprot(PTE_SPECIAL));
 }
 
+#define pte_mkdevmap pte_mkspecial
+
 static inline pte_t pte_mkcont(pte_t pte)
 {
 	pte = set_pte_bit(pte, __pgprot(PTE_CONT));
@@ -193,7 +202,7 @@ static inline void set_pte(pte_t *ptep, pte_t pte)
 	 * or update_mmu_cache() have the necessary barriers.
 	 */
 	if (pte_valid_not_user(pte)) {
-		dsb(ishst);
+		__DSB_FOR_PGTABLE();
 		isb();
 	}
 }
@@ -397,7 +406,7 @@ static inline bool pud_table(pud_t pud) { return true; }
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
 	*pmdp = pmd;
-	dsb(ishst);
+	__DSB_FOR_PGTABLE();
 	isb();
 }
 
@@ -409,6 +418,11 @@ static inline void pmd_clear(pmd_t *pmdp)
 static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 {
 	return pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline pte_t *pmd_page_vaddr(pmd_t pmd)
+{
+	return __va(pmd_page_paddr(pmd));
 }
 
 static inline void pte_unmap(pte_t *pte) { }
@@ -449,7 +463,7 @@ static inline void pte_unmap(pte_t *pte) { }
 static inline void set_pud(pud_t *pudp, pud_t pud)
 {
 	*pudp = pud;
-	dsb(ishst);
+	__DSB_FOR_PGTABLE();
 	isb();
 }
 
@@ -461,6 +475,11 @@ static inline void pud_clear(pud_t *pudp)
 static inline phys_addr_t pud_page_paddr(pud_t pud)
 {
 	return pud_val(pud) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline unsigned long pud_page_vaddr(pud_t pud)
+{
+	return (unsigned long) __va(pud_page_paddr(pud));
 }
 
 /* Find an entry in the second-level page table. */
@@ -502,7 +521,7 @@ static inline phys_addr_t pud_page_paddr(pud_t pud)
 static inline void set_pgd(pgd_t *pgdp, pgd_t pgd)
 {
 	*pgdp = pgd;
-	dsb(ishst);
+	__DSB_FOR_PGTABLE();
 }
 
 static inline void pgd_clear(pgd_t *pgdp)
@@ -513,6 +532,11 @@ static inline void pgd_clear(pgd_t *pgdp)
 static inline phys_addr_t pgd_page_paddr(pgd_t pgd)
 {
 	return pgd_val(pgd) & PHYS_MASK & (s32)PAGE_MASK;
+}
+
+static inline unsigned long pgd_page_vaddr(pgd_t pgd)
+{
+	return (unsigned long) __va(pgd_page_paddr(pgd));
 }
 
 /* Find an entry in the frst-level page table. */
@@ -617,6 +641,12 @@ static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
 					    pte_t *ptep)
 {
 	return __ptep_test_and_clear_young(ptep);
+}
+#define __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH
+static inline int ptep_clear_flush_young(struct vm_area_struct *vma,
+					 unsigned long address, pte_t *ptep)
+{
+	return ptep_test_and_clear_young(vma, address, ptep);
 }
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE

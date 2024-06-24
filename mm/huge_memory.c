@@ -611,19 +611,25 @@ static int __do_huge_pmd_anonymous_page(struct fault_env *fe, struct page *page,
  */
 static inline gfp_t alloc_hugepage_direct_gfpmask(struct vm_area_struct *vma)
 {
+	gfp_t gfp = GFP_TRANSHUGE_LIGHT;
 	bool vma_madvised = !!(vma->vm_flags & VM_HUGEPAGE);
 
 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG,
 				&transparent_hugepage_flags) && vma_madvised)
-		return GFP_TRANSHUGE;
+		gfp = GFP_TRANSHUGE;
 	else if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_FLAG,
 						&transparent_hugepage_flags))
-		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
+		gfp = GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
 	else if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG,
 						&transparent_hugepage_flags))
-		return GFP_TRANSHUGE | (vma_madvised ? 0 : __GFP_NORETRY);
+		gfp = GFP_TRANSHUGE | (vma_madvised ? 0 : __GFP_NORETRY);
 
-	return GFP_TRANSHUGE_LIGHT;
+	/* Disable movable allocations to avoid fallback to CMA.
+	 * Unmovable allocations can fallback to movable anyway.
+	 */
+	gfp &= ~__GFP_MOVABLE;
+
+	return gfp;
 }
 
 /* Caller must hold page table lock. */
@@ -1938,6 +1944,7 @@ static void __split_huge_page_tail(struct page *head, int tail,
 			 (1L << PG_mlocked) |
 			 (1L << PG_uptodate) |
 			 (1L << PG_active) |
+			 (1L << PG_workingset) |
 			 (1L << PG_locked) |
 			 (1L << PG_unevictable) |
 			 (1L << PG_dirty)));
@@ -1989,7 +1996,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 		__split_huge_page_tail(head, i, lruvec, list);
 		/* Some pages can be beyond i_size: drop them from page cache */
 		if (head[i].index >= end) {
-			__ClearPageDirty(head + i);
+			ClearPageDirty(head + i);
 			__delete_from_page_cache(head + i, NULL);
 			if (IS_ENABLED(CONFIG_SHMEM) && PageSwapBacked(head))
 				shmem_uncharge(head->mapping->host, 1);

@@ -5,6 +5,7 @@
  * Copyright Hans de Goede <hdegoede@redhat.com> for Red Hat, Inc. 2013 - 2016
  * Copyright Matthew Wilcox for Intel Corp, 2010
  * Copyright Sarah Sharp for Intel Corp, 2010
+ * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
  *
  * Distributed under the terms of the GNU GPL, version two.
  */
@@ -849,6 +850,8 @@ static int uas_slave_alloc(struct scsi_device *sdev)
 	else if (devinfo->flags & US_FL_MAX_SECTORS_240)
 		blk_queue_max_hw_sectors(sdev->request_queue, 240);
 
+	blk_queue_rq_timeout(sdev->request_queue, HZ);
+
 	return 0;
 }
 
@@ -1155,6 +1158,24 @@ static int uas_post_reset(struct usb_interface *intf)
 
 	scsi_unblock_requests(shost);
 
+	/*
+	 * This function should be called with usb dev locked.
+	 * devinfo->resetting is also protected by usb dev lock, and will
+	 * only be altered when usb dev is locked.
+	 * So, it's safe to access devinfo->resetting here.
+	 */
+	if (devinfo->resetting && err) {
+		/*
+		 * If devinfo->resetting is set, it means this function
+		 * is called from uas_eh_bus_reset_handler.
+		 * In order to avoid deadlock, return 0 to avoid unmount &
+		 * remount operations. But also trigger an asynchronous
+		 * usb reset to do the unmount & remount.
+		 */
+		usb_queue_reset_device(devinfo->intf);
+		return 0;
+	}
+
 	return err ? 1 : 0;
 }
 
@@ -1256,6 +1277,7 @@ static struct usb_driver uas_driver = {
 	.resume = uas_resume,
 	.reset_resume = uas_reset_resume,
 	.drvwrap.driver.shutdown = uas_shutdown,
+	.drvwrap.driver.probe_type = PROBE_FORCE_SYNCHRONOUS,
 	.id_table = uas_usb_ids,
 };
 

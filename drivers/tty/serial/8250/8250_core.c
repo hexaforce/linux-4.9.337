@@ -58,7 +58,15 @@ static struct uart_driver serial8250_reg;
 
 static unsigned int skip_txen_test; /* force skip of txen test at init time */
 
-#define PASS_LIMIT	512
+/*
+ * On -rt we can have a more delays, and legitimately
+ * so - so don't drop work spuriously and spam the
+ * syslog:
+ *
+ * Even in non-rt environment (under hypervisor) this constant might be
+ * too small
+ */
+#define PASS_LIMIT	1000000
 
 #include <asm/serial.h>
 /*
@@ -500,7 +508,8 @@ static void __init serial8250_isa_init_ports(void)
 {
 	struct uart_8250_port *up;
 	static int first = 1;
-	int i, irqflag = 0;
+	unsigned int i;
+	int irqflag = 0;
 
 	if (!first)
 		return;

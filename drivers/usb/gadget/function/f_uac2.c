@@ -1176,7 +1176,7 @@ afunc_set_alt(struct usb_function *fn, unsigned intf, unsigned alt)
 	struct usb_request *req;
 	struct usb_ep *ep;
 	struct uac2_rtd_params *prm;
-	int req_len, i;
+	int req_len, i, ret;
 
 	/* No i/f has more than 2 alt settings */
 	if (alt > 1) {
@@ -1196,7 +1196,10 @@ afunc_set_alt(struct usb_function *fn, unsigned intf, unsigned alt)
 	if (intf == agdev->as_out_intf) {
 		ep = agdev->out_ep;
 		prm = &uac2->c_prm;
-		config_ep_by_speed(gadget, fn, ep);
+		ret = config_ep_by_speed(gadget, fn, ep);
+		if (ret)
+			return ret;
+
 		agdev->as_out_alt = alt;
 		req_len = prm->max_psize;
 	} else if (intf == agdev->as_in_intf) {
@@ -1206,7 +1209,10 @@ afunc_set_alt(struct usb_function *fn, unsigned intf, unsigned alt)
 
 		ep = agdev->in_ep;
 		prm = &uac2->p_prm;
-		config_ep_by_speed(gadget, fn, ep);
+		ret = config_ep_by_speed(gadget, fn, ep);
+		if (ret)
+			return ret;
+
 		agdev->as_in_alt = alt;
 
 		/* pre-calculate the playback endpoint's interval */

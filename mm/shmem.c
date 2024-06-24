@@ -101,12 +101,20 @@ struct shmem_falloc {
 #ifdef CONFIG_TMPFS
 static unsigned long shmem_default_max_blocks(void)
 {
+#ifdef CONFIG_SHMEM_ALL_RAM
+	return totalram_pages;
+#else
 	return totalram_pages / 2;
+#endif
 }
 
 static unsigned long shmem_default_max_inodes(void)
 {
+#ifdef CONFIG_SHMEM_ALL_RAM
+	return min(totalram_pages - totalhigh_pages, totalram_pages);
+#else
 	return min(totalram_pages - totalhigh_pages, totalram_pages / 2);
+#endif
 }
 #endif
 
@@ -1424,6 +1432,7 @@ static struct page *shmem_alloc_hugepage(gfp_t gfp,
 	rcu_read_unlock();
 
 	shmem_pseudo_vma_init(&pvma, info, hindex);
+	gfp &= ~__GFP_MOVABLE;
 	page = alloc_pages_vma(gfp | __GFP_COMP | __GFP_NORETRY | __GFP_NOWARN,
 			HPAGE_PMD_ORDER, &pvma, 0, numa_node_id(), true);
 	shmem_pseudo_vma_destroy(&pvma);
@@ -4098,6 +4107,14 @@ struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags
 }
 EXPORT_SYMBOL_GPL(shmem_file_setup);
 
+void shmem_set_file(struct vm_area_struct *vma, struct file *file)
+{
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	vma->vm_file = file;
+	vma->vm_ops = &shmem_vm_ops;
+}
+
 /**
  * shmem_zero_setup - setup a shared anonymous mapping
  * @vma: the vma to be mmapped is prepared by do_mmap_pgoff
@@ -4117,10 +4134,7 @@ int shmem_zero_setup(struct vm_area_struct *vma)
 	if (IS_ERR(file))
 		return PTR_ERR(file);
 
-	if (vma->vm_file)
-		fput(vma->vm_file);
-	vma->vm_file = file;
-	vma->vm_ops = &shmem_vm_ops;
+	shmem_set_file(vma, file);
 
 	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE) &&
 			((vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK) <

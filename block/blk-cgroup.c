@@ -184,7 +184,7 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg,
 		goto err_free_blkg;
 	}
 
-	wb_congested = wb_congested_get_create(&q->backing_dev_info,
+	wb_congested = wb_congested_get_create(q->backing_dev_info,
 					       blkcg->css.id,
 					       GFP_NOWAIT | __GFP_NOWARN);
 	if (!wb_congested) {
@@ -469,8 +469,8 @@ static int blkcg_reset_stats(struct cgroup_subsys_state *css,
 const char *blkg_dev_name(struct blkcg_gq *blkg)
 {
 	/* some drivers (floppy) instantiate a queue w/o disk registered */
-	if (blkg->q->backing_dev_info.dev)
-		return dev_name(blkg->q->backing_dev_info.dev);
+	if (blkg->q->backing_dev_info->dev)
+		return dev_name(blkg->q->backing_dev_info->dev);
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(blkg_dev_name);
@@ -984,7 +984,7 @@ blkcg_css_alloc(struct cgroup_subsys_state *parent_css)
 	struct blkcg *blkcg;
 	struct cgroup_subsys_state *ret;
 	int i;
-
+	bool free_blk_cg = false;
 	mutex_lock(&blkcg_pol_mutex);
 
 	if (!parent_css) {
@@ -995,6 +995,7 @@ blkcg_css_alloc(struct cgroup_subsys_state *parent_css)
 			ret = ERR_PTR(-ENOMEM);
 			goto free_blkcg;
 		}
+		free_blk_cg = true;
 	}
 
 	for (i = 0; i < BLKCG_MAX_POLS ; i++) {
@@ -1038,7 +1039,8 @@ free_pd_blkcg:
 		if (blkcg->cpd[i])
 			blkcg_policy[i]->cpd_free_fn(blkcg->cpd[i]);
 free_blkcg:
-	kfree(blkcg);
+	if (free_blk_cg)
+		kfree(blkcg);
 	mutex_unlock(&blkcg_pol_mutex);
 	return ret;
 }

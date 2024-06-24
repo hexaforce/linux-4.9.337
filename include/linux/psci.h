@@ -49,8 +49,12 @@ struct psci_operations {
 	enum smccc_version smccc_version;
 };
 
-extern struct psci_operations psci_ops;
+struct extended_psci_operations {
+	u32 (*make_power_state)(u32 state);
+};
 
+extern struct psci_operations psci_ops;
+extern struct extended_psci_operations extended_ops;
 #if defined(CONFIG_ARM_PSCI_FW)
 int __init psci_dt_init(void);
 #else
@@ -65,5 +69,8 @@ bool __init acpi_psci_use_hvc(void);
 static inline int psci_acpi_init(void) { return 0; }
 static inline bool acpi_psci_present(void) { return false; }
 #endif
+
+extern void (*psci_handle_reboot_cmd)(const char *cmd);
+extern void (*psci_prepare_poweroff)(void);
 
 #endif /* __LINUX_PSCI_H */

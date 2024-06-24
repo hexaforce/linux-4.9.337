@@ -30,6 +30,7 @@
 #include <sound/initval.h>
 #include <sound/tlv.h>
 #include <sound/rt5659.h>
+#include <linux/of_gpio.h>
 
 #include "rl6231.h"
 #include "rt5659.h"
@@ -1251,6 +1252,34 @@ static int rt5659_hp_vol_put(struct snd_kcontrol *kcontrol,
 	return ret;
 }
 
+/**
+ * manage_dapm_pin - enable or disable dapm pin
+ * @codec: SoC audio codec device.
+ * @pin_name: dapm widget name
+ * @enable: enable when true, disable otherwise
+ *
+ */
+
+static void manage_dapm_pin(struct snd_soc_codec *codec, const char *pin_name,
+	bool enable)
+{
+	char prefixed_ctl[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
+	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
+
+	if (!codec->component.name_prefix) {
+		snprintf(prefixed_ctl, sizeof(prefixed_ctl), "%s",
+			pin_name);
+	} else {
+		snprintf(prefixed_ctl, sizeof(prefixed_ctl), "%s %s",
+			codec->component.name_prefix, pin_name);
+	}
+
+	if (enable)
+		snd_soc_dapm_force_enable_pin(dapm, prefixed_ctl);
+	else
+		snd_soc_dapm_disable_pin(dapm, prefixed_ctl);
+}
+
 static void rt5659_enable_push_button_irq(struct snd_soc_codec *codec,
 	bool enable)
 {
@@ -1260,9 +1289,8 @@ static void rt5659_enable_push_button_irq(struct snd_soc_codec *codec,
 		snd_soc_write(codec, RT5659_4BTN_IL_CMD_1, 0x000b);
 
 		/* MICBIAS1 and Mic Det Power for button detect*/
-		snd_soc_dapm_force_enable_pin(dapm, "MICBIAS1");
-		snd_soc_dapm_force_enable_pin(dapm,
-			"Mic Det Power");
+		manage_dapm_pin(codec, "MICBIAS1", true);
+		manage_dapm_pin(codec, "Mic Det Power", true);
 		snd_soc_dapm_sync(dapm);
 
 		snd_soc_update_bits(codec, RT5659_PWR_ANLG_2,
@@ -1280,8 +1308,8 @@ static void rt5659_enable_push_button_irq(struct snd_soc_codec *codec,
 		snd_soc_update_bits(codec, RT5659_IRQ_CTRL_2,
 				RT5659_IL_IRQ_MASK, RT5659_IL_IRQ_DIS);
 		/* MICBIAS1 and Mic Det Power for button detect*/
-		snd_soc_dapm_disable_pin(dapm, "MICBIAS1");
-		snd_soc_dapm_disable_pin(dapm, "Mic Det Power");
+		manage_dapm_pin(codec, "MICBIAS1", false);
+		manage_dapm_pin(codec, "Mic Det Power", false);
 		snd_soc_dapm_sync(dapm);
 	}
 }
@@ -1305,8 +1333,9 @@ static int rt5659_headset_detect(struct snd_soc_codec *codec, int jack_insert)
 	struct rt5659_priv *rt5659 = snd_soc_codec_get_drvdata(codec);
 
 	if (jack_insert) {
-		snd_soc_dapm_force_enable_pin(dapm,
-			"Mic Det Power");
+		manage_dapm_pin(codec, "LDO2", true);
+		manage_dapm_pin(codec, "MICBIAS1", true);
+		manage_dapm_pin(codec, "Mic Det Power", true);
 		snd_soc_dapm_sync(dapm);
 		reg_63 = snd_soc_read(codec, RT5659_PWR_ANLG_1);
 
@@ -1336,20 +1365,31 @@ static int rt5659_headset_detect(struct snd_soc_codec *codec, int jack_insert)
 		case 1:
 			rt5659->jack_type = SND_JACK_HEADSET;
 			rt5659_enable_push_button_irq(codec, true);
+			snd_soc_update_bits(codec, RT5659_PWR_ANLG_2,
+				RT5659_PWR_BST1 | RT5659_PWR_BST1_P,
+				RT5659_PWR_BST1 | RT5659_PWR_BST1_P);
 			break;
 		default:
 			snd_soc_write(codec, RT5659_PWR_ANLG_1, reg_63);
 			rt5659->jack_type = SND_JACK_HEADPHONE;
-			snd_soc_dapm_disable_pin(dapm, "Mic Det Power");
+			manage_dapm_pin(codec, "LDO2", false);
+			manage_dapm_pin(codec, "MICBIAS1", false);
+			manage_dapm_pin(codec, "Mic Det Power", false);
 			snd_soc_dapm_sync(dapm);
 			break;
 		}
 	} else {
-		snd_soc_dapm_disable_pin(dapm, "Mic Det Power");
-		snd_soc_dapm_sync(dapm);
-		if (rt5659->jack_type == SND_JACK_HEADSET)
+		if (rt5659->jack_type == SND_JACK_HEADSET) {
 			rt5659_enable_push_button_irq(codec, false);
+			snd_soc_update_bits(codec, RT5659_PWR_ANLG_2,
+				RT5659_PWR_BST1 | RT5659_PWR_BST1_P, 0);
+		}
 		rt5659->jack_type = 0;
+
+		manage_dapm_pin(codec, "LDO2", false);
+		manage_dapm_pin(codec, "MICBIAS1", false);
+		manage_dapm_pin(codec, "Mic Det Power", false);
+		snd_soc_dapm_sync(dapm);
 	}
 
 	dev_dbg(codec->dev, "jack_type = %d\n", rt5659->jack_type);
@@ -1371,8 +1411,11 @@ static irqreturn_t rt5659_irq(int irq, void *data)
 {
 	struct rt5659_priv *rt5659 = data;
 
-	queue_delayed_work(system_power_efficient_wq,
-			   &rt5659->jack_detect_work, msecs_to_jiffies(250));
+	if (rt5659->pdata.jd_src == RT5659_JD3 ||
+	    rt5659->pdata.jd_src == RT5659_JD_NULL)
+		queue_delayed_work(system_power_efficient_wq,
+				   &rt5659->jack_detect_work,
+				   msecs_to_jiffies(250));
 
 	return IRQ_HANDLED;
 }
@@ -1389,6 +1432,64 @@ int rt5659_set_jack_detect(struct snd_soc_codec *codec,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(rt5659_set_jack_detect);
+
+static void rt5659_jack_detect_intel_hd_header(struct work_struct *work)
+{
+	struct rt5659_priv *rt5659 =
+		container_of(work, struct rt5659_priv, jack_detect_work.work);
+	unsigned int value;
+	bool hp_flag, mic_flag;
+
+	/* headphone jack */
+	regmap_read(rt5659->regmap, RT5659_GPIO_STA, &value);
+	hp_flag = (!(value & 0x8)) ? true : false;
+
+	if (hp_flag != rt5659->hp_state) {
+		rt5659->hp_state = hp_flag;
+
+		if (hp_flag) {
+			regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_1,
+				0x10, 0x0);
+			rt5659->jack_type |= SND_JACK_HEADPHONE;
+		} else {
+			regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_1,
+				0x10, 0x10);
+
+			rt5659->jack_type = rt5659->jack_type &
+				(~SND_JACK_HEADPHONE);
+		}
+
+		snd_soc_jack_report(rt5659->hs_jack, rt5659->jack_type,
+			SND_JACK_HEADPHONE);
+	}
+
+	/* for mic jack */
+	regmap_read(rt5659->regmap, RT5659_4BTN_IL_CMD_1, &value);
+	regmap_write(rt5659->regmap, RT5659_4BTN_IL_CMD_1, value);
+	mic_flag = (value & 0x2000) ? true : false;
+
+	if (mic_flag != rt5659->mic_state) {
+		rt5659->mic_state = mic_flag;
+		if (mic_flag) {
+			regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_2,
+				0x2, 0x2);
+			regmap_update_bits(rt5659->regmap, RT5659_PWR_ANLG_2,
+				RT5659_PWR_BST1 | RT5659_PWR_BST1_P,
+				RT5659_PWR_BST1 | RT5659_PWR_BST1_P);
+			rt5659->jack_type |= SND_JACK_MICROPHONE;
+		} else {
+			regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_2,
+				0x2, 0x0);
+			regmap_update_bits(rt5659->regmap, RT5659_PWR_ANLG_2,
+				RT5659_PWR_BST1 | RT5659_PWR_BST1_P, 0);
+			rt5659->jack_type = rt5659->jack_type
+				& (~SND_JACK_MICROPHONE);
+		}
+
+		snd_soc_jack_report(rt5659->hs_jack, rt5659->jack_type,
+			SND_JACK_HEADSET);
+	}
+}
 
 static void rt5659_jack_detect_work(struct work_struct *work)
 {
@@ -2456,16 +2557,16 @@ static const struct snd_soc_dapm_widget rt5659_dapm_widgets[] = {
 		RT5659_DMIC_2_EN_SFT, 0, set_dmic_power, SND_SOC_DAPM_POST_PMU),
 
 	/* Boost */
-	SND_SOC_DAPM_PGA("BST1", RT5659_PWR_ANLG_2,
-		RT5659_PWR_BST1_P_BIT, 0, NULL, 0),
+	SND_SOC_DAPM_PGA("BST1", SND_SOC_NOPM,
+		0, 0, NULL, 0),
 	SND_SOC_DAPM_PGA("BST2", RT5659_PWR_ANLG_2,
 		RT5659_PWR_BST2_P_BIT, 0, NULL, 0),
 	SND_SOC_DAPM_PGA("BST3", RT5659_PWR_ANLG_2,
 		RT5659_PWR_BST3_P_BIT, 0, NULL, 0),
 	SND_SOC_DAPM_PGA("BST4", RT5659_PWR_ANLG_2,
 		RT5659_PWR_BST4_P_BIT, 0, NULL, 0),
-	SND_SOC_DAPM_SUPPLY("BST1 Power", RT5659_PWR_ANLG_2,
-		RT5659_PWR_BST1_BIT, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("BST1 Power", SND_SOC_NOPM,
+		0, 0, NULL, 0),
 	SND_SOC_DAPM_SUPPLY("BST2 Power", RT5659_PWR_ANLG_2,
 		RT5659_PWR_BST2_BIT, 0, NULL, 0),
 	SND_SOC_DAPM_SUPPLY("BST3 Power", RT5659_PWR_ANLG_2,
@@ -3256,16 +3357,17 @@ static int rt5659_hw_params(struct snd_pcm_substream *substream,
 	dev_dbg(dai->dev, "lrck is %dHz and pre_div is %d for iis %d\n",
 				rt5659->lrck[dai->id], pre_div, dai->id);
 
-	switch (params_width(params)) {
-	case 16:
+	switch (params_format(params)) {
+	case SNDRV_PCM_FORMAT_S16_LE:
 		break;
-	case 20:
+	case SNDRV_PCM_FORMAT_S20_3LE:
 		val_len |= RT5659_I2S_DL_20;
 		break;
-	case 24:
+	case SNDRV_PCM_FORMAT_S24_LE:
+	case SNDRV_PCM_FORMAT_S32_LE:
 		val_len |= RT5659_I2S_DL_24;
 		break;
-	case 8:
+	case SNDRV_PCM_FORMAT_S8:
 		val_len |= RT5659_I2S_DL_8;
 		break;
 	default:
@@ -3301,15 +3403,18 @@ static int rt5659_hw_params(struct snd_pcm_substream *substream,
 	switch (rt5659->lrck[dai->id]) {
 	case 192000:
 		snd_soc_update_bits(codec, RT5659_ADDA_CLK_1,
-			RT5659_DAC_OSR_MASK, RT5659_DAC_OSR_32);
+			RT5659_DAC_OSR_MASK | RT5659_ADC_OSR_MASK,
+			RT5659_DAC_OSR_32 | RT5659_ADC_OSR_32);
 		break;
 	case 96000:
 		snd_soc_update_bits(codec, RT5659_ADDA_CLK_1,
-			RT5659_DAC_OSR_MASK, RT5659_DAC_OSR_64);
+			RT5659_DAC_OSR_MASK | RT5659_ADC_OSR_MASK,
+			RT5659_DAC_OSR_64 | RT5659_ADC_OSR_64);
 		break;
 	default:
 		snd_soc_update_bits(codec, RT5659_ADDA_CLK_1,
-			RT5659_DAC_OSR_MASK, RT5659_DAC_OSR_128);
+			RT5659_DAC_OSR_MASK | RT5659_ADC_OSR_MASK,
+			RT5659_DAC_OSR_128 | RT5659_ADC_OSR_128);
 		break;
 	}
 
@@ -3382,6 +3487,117 @@ static int rt5659_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	}
 	return 0;
 }
+
+void rt565x_parse_codec_pll_source(struct platform_device *pdev,
+	int *pll_source_id, bool *is_mclk_enabled)
+{
+	const char *pll_source;
+	struct device_node *sound_node = pdev->dev.of_node;
+
+	if (of_property_read_string(sound_node, "rt565x,codec-pll-source",
+		&pll_source) < 0) {
+		dev_info(&pdev->dev,
+			"pll source property is missing - using MCLK\n");
+		*is_mclk_enabled = true;
+		*pll_source_id = RT5659_PLL1_S_INVALID;
+		return;
+	}
+
+	if (!strcmp(pll_source, "mclk")) {
+		*pll_source_id = RT5659_PLL1_S_MCLK;
+		*is_mclk_enabled = true;
+		return;
+	} else if (!strcmp(pll_source, "bclk1"))
+		*pll_source_id = RT5659_PLL1_S_BCLK1;
+	else if (!strcmp(pll_source, "bclk2"))
+		*pll_source_id = RT5659_PLL1_S_BCLK2;
+	else if (!strcmp(pll_source, "bclk3"))
+		*pll_source_id = RT5659_PLL1_S_BCLK3;
+	else if (!strcmp(pll_source, "bclk4"))
+		*pll_source_id = RT5659_PLL1_S_BCLK4;
+	else {
+		dev_info(&pdev->dev,
+			"Unsupported codec pll source, fall back to MCLK\n");
+		*is_mclk_enabled = true;
+		*pll_source_id = RT5659_PLL1_S_INVALID;
+		return;
+	}
+
+	*is_mclk_enabled = false;
+}
+EXPORT_SYMBOL_GPL(rt565x_parse_codec_pll_source);
+
+int rt565x_manage_codec_sysclk(struct snd_soc_pcm_stream *dai_params,
+	struct snd_soc_dai *dai, int pll_source_id)
+{
+	int err, sysclk_source;
+	unsigned int srate, sysclk_rate;
+
+	srate = dai_params->rate_min;
+	sysclk_rate = srate << 8; /* 256 times the sample rate */
+
+	switch (pll_source_id) {
+	case RT5659_PLL1_S_BCLK1: {
+		unsigned int bclk_rate, format_bps, channels;
+
+		channels = dai_params->channels_min;
+
+		switch (dai_params->formats) {
+		case SNDRV_PCM_FMTBIT_S8:
+			format_bps = 8;
+			break;
+		case SNDRV_PCM_FMTBIT_S16_LE:
+			format_bps = 16;
+			break;
+		case SNDRV_PCM_FMTBIT_S24_LE:
+			format_bps = 24;
+			break;
+		case SNDRV_PCM_FMTBIT_S32_LE:
+			format_bps = 32;
+			break;
+		default:
+			dev_err(dai->codec->dev, "wrong format = %llu\n",
+				dai_params->formats);
+			return -EINVAL;
+		}
+
+		bclk_rate = srate * format_bps * channels;
+		err = snd_soc_dai_set_pll(dai, 0, RT5659_PLL1_S_BCLK1,
+			bclk_rate, sysclk_rate);
+		if (err < 0) {
+			dev_err(dai->codec->dev,
+				"not able to set codec pll\n");
+			return err;
+		}
+		sysclk_source = RT5659_SCLK_S_PLL1;
+		break;
+	}
+
+	/* TODO: support for below pll sources */
+	case RT5659_PLL1_S_MCLK:
+	case RT5659_PLL1_S_BCLK2:
+	case RT5659_PLL1_S_BCLK3:
+	case RT5659_PLL1_S_BCLK4:
+		dev_err(dai->codec->dev,
+			"pll source - %d not yet implemented\n",
+			pll_source_id);
+		return -EINVAL;
+
+	default:
+		sysclk_source = RT5659_SCLK_S_MCLK;
+		break;
+	}
+
+	err = snd_soc_dai_set_sysclk(dai, sysclk_source,
+			sysclk_rate, SND_SOC_CLOCK_IN);
+	if (err < 0) {
+		dev_err(dai->codec->dev, "not able to set sysclk for codec\n");
+		return err;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rt565x_manage_codec_sysclk);
 
 static int rt5659_set_dai_sysclk(struct snd_soc_dai *dai,
 		int clk_id, unsigned int freq, int dir)
@@ -3620,12 +3836,73 @@ static int rt5659_set_bias_level(struct snd_soc_codec *codec,
 	return 0;
 }
 
+void rt5659_intel_hd_header_probe_setup(struct rt5659_priv *rt5659)
+{
+	struct snd_soc_dapm_context *dapm =
+		snd_soc_codec_get_dapm(rt5659->codec);
+	int value;
+
+	regmap_read(rt5659->regmap, RT5659_GPIO_STA, &value);
+
+	if (!(value & 0x8)) {
+		regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_1,
+			0x10, 0x0);
+	} else {
+		regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_1,
+			0x10, 0x10);
+	}
+
+	regmap_update_bits(rt5659->regmap, RT5659_PWR_ANLG_1,
+		RT5659_PWR_VREF2 | RT5659_PWR_MB,
+		RT5659_PWR_VREF2 | RT5659_PWR_MB);
+	msleep(20);
+	regmap_update_bits(rt5659->regmap, RT5659_PWR_ANLG_1,
+		RT5659_PWR_FV2, RT5659_PWR_FV2);
+
+	manage_dapm_pin(rt5659->codec, "LDO2", true);
+	manage_dapm_pin(rt5659->codec, "MICBIAS1", true);
+	manage_dapm_pin(rt5659->codec, "Mic Det Power", true);
+	snd_soc_dapm_sync(dapm);
+
+	msleep(20);
+
+	regmap_update_bits(rt5659->regmap, RT5659_4BTN_IL_CMD_2,
+		RT5659_4BTN_IL_MASK, RT5659_4BTN_IL_EN);
+	regmap_read(rt5659->regmap, RT5659_4BTN_IL_CMD_1, &value);
+	regmap_write(rt5659->regmap, RT5659_4BTN_IL_CMD_1, value);
+	regmap_read(rt5659->regmap, RT5659_4BTN_IL_CMD_1, &value);
+
+	if (value & 0x2000) {
+		regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_2,
+			0x2, 0x2);
+		regmap_update_bits(rt5659->regmap, RT5659_PWR_ANLG_2,
+			RT5659_PWR_BST1 | RT5659_PWR_BST1_P,
+			RT5659_PWR_BST1 | RT5659_PWR_BST1_P);
+	} else {
+		regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_2,
+			0x2, 0x0);
+		regmap_update_bits(rt5659->regmap, RT5659_PWR_ANLG_2,
+			RT5659_PWR_BST1 | RT5659_PWR_BST1_P, 0);
+	}
+	snd_soc_dapm_sync(dapm);
+
+	regmap_update_bits(rt5659->regmap, RT5659_IRQ_CTRL_2,
+		RT5659_IL_IRQ_MASK, RT5659_IL_IRQ_EN);
+}
+
 static int rt5659_probe(struct snd_soc_codec *codec)
 {
 	struct rt5659_priv *rt5659 = snd_soc_codec_get_drvdata(codec);
 
 	rt5659->codec = codec;
 
+	switch (rt5659->pdata.jd_src) {
+	case RT5659_JD_NULL:
+		rt5659_intel_hd_header_probe_setup(rt5659);
+		break;
+	default:
+		break;
+	}
 	return 0;
 }
 
@@ -3638,33 +3915,48 @@ static int rt5659_remove(struct snd_soc_codec *codec)
 	return 0;
 }
 
-#ifdef CONFIG_PM
-static int rt5659_suspend(struct snd_soc_codec *codec)
+#ifdef CONFIG_PM_SLEEP
+static int rt5659_suspend(struct device *dev)
 {
-	struct rt5659_priv *rt5659 = snd_soc_codec_get_drvdata(codec);
+	struct rt5659_priv *rt5659 = dev_get_drvdata(dev);
+
+	if (rt5659->i2c->irq) {
+		/* disable jack interrupts during system suspend */
+		disable_irq(rt5659->i2c->irq);
+	}
+
+	if (rt5659->pdata.jd_src == RT5659_JD3 ||
+	    rt5659->pdata.jd_src == RT5659_JD_NULL)
+		cancel_delayed_work_sync(&rt5659->jack_detect_work);
 
 	regcache_cache_only(rt5659->regmap, true);
 	regcache_mark_dirty(rt5659->regmap);
+
 	return 0;
 }
 
-static int rt5659_resume(struct snd_soc_codec *codec)
+static int rt5659_resume(struct device *dev)
 {
-	struct rt5659_priv *rt5659 = snd_soc_codec_get_drvdata(codec);
+	struct rt5659_priv *rt5659 = dev_get_drvdata(dev);
 
 	regcache_cache_only(rt5659->regmap, false);
 	regcache_sync(rt5659->regmap);
+	if (rt5659->i2c->irq)
+		enable_irq(rt5659->i2c->irq);
+
+	if (rt5659->pdata.jd_src == RT5659_JD3 ||
+	    rt5659->pdata.jd_src == RT5659_JD_NULL)
+		queue_delayed_work(system_power_efficient_wq,
+				   &rt5659->jack_detect_work, 0);
 
 	return 0;
 }
-#else
-#define rt5659_suspend NULL
-#define rt5659_resume NULL
 #endif
 
 #define RT5659_STEREO_RATES SNDRV_PCM_RATE_8000_192000
 #define RT5659_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | \
-		SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S8)
+		SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE | \
+		SNDRV_PCM_FMTBIT_S8)
 
 static const struct snd_soc_dai_ops rt5659_aif_dai_ops = {
 	.hw_params = rt5659_hw_params,
@@ -3738,8 +4030,6 @@ static struct snd_soc_dai_driver rt5659_dai[] = {
 static struct snd_soc_codec_driver soc_codec_dev_rt5659 = {
 	.probe = rt5659_probe,
 	.remove = rt5659_remove,
-	.suspend = rt5659_suspend,
-	.resume = rt5659_resume,
 	.set_bias_level = rt5659_set_bias_level,
 	.idle_bias_off = true,
 	.component_driver = {
@@ -3852,7 +4142,7 @@ static void rt5659_calibrate(struct rt5659_priv *rt5659)
 			break;
 
 		if (count > 30) {
-			dev_err(rt5659->codec->dev,
+			dev_err(&rt5659->i2c->dev,
 				"HP Calibration 1 Failure\n");
 			return;
 		}
@@ -3877,7 +4167,7 @@ static void rt5659_calibrate(struct rt5659_priv *rt5659)
 			break;
 
 		if (count > 85) {
-			dev_err(rt5659->codec->dev,
+			dev_err(&rt5659->i2c->dev,
 				"HP Calibration 2 Failure\n");
 			return;
 		}
@@ -3925,7 +4215,7 @@ static void rt5659_calibrate(struct rt5659_priv *rt5659)
 			break;
 
 		if (count > 10) {
-			dev_err(rt5659->codec->dev,
+			dev_err(&rt5659->i2c->dev,
 				"SPK Calibration Failure\n");
 			return;
 		}
@@ -3958,7 +4248,7 @@ static void rt5659_calibrate(struct rt5659_priv *rt5659)
 			break;
 
 		if (count > 35) {
-			dev_err(rt5659->codec->dev,
+			dev_err(&rt5659->i2c->dev,
 				"Mono Calibration Failure\n");
 			return;
 		}
@@ -3998,7 +4288,7 @@ static int rt5659_i2c_probe(struct i2c_client *i2c,
 {
 	struct rt5659_platform_data *pdata = dev_get_platdata(&i2c->dev);
 	struct rt5659_priv *rt5659;
-	int ret;
+	int ret, jack_gpio;
 	unsigned int val;
 
 	rt5659 = devm_kzalloc(&i2c->dev, sizeof(struct rt5659_priv),
@@ -4007,6 +4297,7 @@ static int rt5659_i2c_probe(struct i2c_client *i2c,
 	if (rt5659 == NULL)
 		return -ENOMEM;
 
+	rt5659->i2c = i2c;
 	i2c_set_clientdata(i2c, rt5659);
 
 	if (pdata)
@@ -4168,6 +4459,11 @@ static int rt5659_i2c_probe(struct i2c_client *i2c,
 			RT5659_DMIC_1_DP_IN2N | RT5659_DMIC_2_DP_IN2P);
 	}
 
+	rt5659->hp_state = false;
+	rt5659->mic_state = false;
+	rt5659->codec = NULL;
+	rt5659->jack_type = 0;
+
 	switch (rt5659->pdata.jd_src) {
 	case RT5659_JD3:
 		regmap_write(rt5659->regmap, RT5659_EJD_CTRL_1, 0xa880);
@@ -4177,17 +4473,35 @@ static int rt5659_i2c_probe(struct i2c_client *i2c,
 				RT5659_PWR_MB, RT5659_PWR_MB);
 		regmap_write(rt5659->regmap, RT5659_PWR_ANLG_2, 0x0001);
 		regmap_write(rt5659->regmap, RT5659_IRQ_CTRL_2, 0x0040);
+		INIT_DELAYED_WORK(&rt5659->jack_detect_work,
+			rt5659_jack_detect_work);
 		break;
 	case RT5659_JD_NULL:
+		regmap_write(rt5659->regmap, RT5659_GPIO_CTRL_1, 0x8000);
+		regmap_write(rt5659->regmap, RT5659_GPIO_CTRL_3, 0x8000);
+		regmap_write(rt5659->regmap, RT5659_RC_CLK_CTRL, 0x0900);
+		regmap_write(rt5659->regmap, RT5659_EJD_CTRL_1,  0x70c0);
+		regmap_write(rt5659->regmap, RT5659_JD_CTRL_1,   0x2000);
+		regmap_write(rt5659->regmap, RT5659_IRQ_CTRL_1,  0x0040);
+
+		INIT_DELAYED_WORK(&rt5659->jack_detect_work,
+			rt5659_jack_detect_intel_hd_header);
 		break;
 	default:
 		dev_warn(&i2c->dev, "Currently, support JD3 only\n");
 		break;
 	}
 
-	INIT_DELAYED_WORK(&rt5659->jack_detect_work, rt5659_jack_detect_work);
+	regmap_update_bits(rt5659->regmap, RT5659_CLK_DET, 0x4, 0x4);
 
-	if (i2c->irq) {
+	jack_gpio = of_get_gpio(rt5659->i2c->dev.of_node, 0);
+	if (gpio_is_valid(jack_gpio)) {
+		rt5659->i2c->irq = gpio_to_irq(jack_gpio);
+		dev_dbg(&i2c->dev, "irq = %d, assigned for jack interrupt handling\n",
+			rt5659->i2c->irq);
+	}
+
+	if (rt5659->i2c->irq) {
 		ret = devm_request_threaded_irq(&i2c->dev, i2c->irq, NULL,
 			rt5659_irq, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING
 			| IRQF_ONESHOT, "rt5659", rt5659);
@@ -4197,6 +4511,7 @@ static int rt5659_i2c_probe(struct i2c_client *i2c,
 		/* Enable IRQ output for GPIO1 pin any way */
 		regmap_update_bits(rt5659->regmap, RT5659_GPIO_CTRL_1,
 				   RT5659_GP1_PIN_MASK, RT5659_GP1_PIN_IRQ);
+
 	}
 
 	return snd_soc_register_codec(&i2c->dev, &soc_codec_dev_rt5659,
@@ -4205,7 +4520,17 @@ static int rt5659_i2c_probe(struct i2c_client *i2c,
 
 static int rt5659_i2c_remove(struct i2c_client *i2c)
 {
+	struct rt5659_priv *rt5659 = i2c_get_clientdata(i2c);
+
 	snd_soc_unregister_codec(&i2c->dev);
+	if (i2c->irq) {
+		/* disable jack interrupts during system suspend */
+		disable_irq(i2c->irq);
+	}
+
+	if (rt5659->pdata.jd_src == RT5659_JD3 ||
+	    rt5659->pdata.jd_src == RT5659_JD_NULL)
+		cancel_delayed_work_sync(&rt5659->jack_detect_work);
 
 	return 0;
 }
@@ -4235,12 +4560,17 @@ static struct acpi_device_id rt5659_acpi_match[] = {
 MODULE_DEVICE_TABLE(acpi, rt5659_acpi_match);
 #endif
 
+static const struct dev_pm_ops rt5659_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(rt5659_suspend, rt5659_resume)
+};
+
 struct i2c_driver rt5659_i2c_driver = {
 	.driver = {
 		.name = "rt5659",
 		.owner = THIS_MODULE,
 		.of_match_table = of_match_ptr(rt5659_of_match),
 		.acpi_match_table = ACPI_PTR(rt5659_acpi_match),
+		.pm = &rt5659_pm_ops,
 	},
 	.probe = rt5659_i2c_probe,
 	.remove = rt5659_i2c_remove,

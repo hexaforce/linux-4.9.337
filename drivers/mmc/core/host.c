@@ -4,6 +4,7 @@
  *  Copyright (C) 2003 Russell King, All Rights Reserved.
  *  Copyright (C) 2007-2008 Pierre Ossman
  *  Copyright (C) 2010 Linus Walleij
+ *  Copyright (c) 2016-2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -30,8 +31,6 @@
 #include "host.h"
 #include "slot-gpio.h"
 #include "pwrseq.h"
-
-#define cls_dev_to_mmc_host(d)	container_of(d, struct mmc_host, class_dev)
 
 static DEFINE_IDA(mmc_host_ida);
 static DEFINE_SPINLOCK(mmc_host_lock);
@@ -299,6 +298,8 @@ int mmc_of_parse(struct mmc_host *host)
 	if (device_property_read_bool(dev, "wakeup-source") ||
 	    device_property_read_bool(dev, "enable-sdio-wakeup")) /* legacy */
 		host->pm_caps |= MMC_PM_WAKE_SDIO_IRQ;
+	if (device_property_read_bool(dev, "ignore-pm-notify"))
+		host->pm_caps |= MMC_PM_IGNORE_PM_NOTIFY;
 	if (device_property_read_bool(dev, "mmc-ddr-1_8v"))
 		host->caps |= MMC_CAP_1_8V_DDR;
 	if (device_property_read_bool(dev, "mmc-ddr-1_2v"))
@@ -319,6 +320,8 @@ int mmc_of_parse(struct mmc_host *host)
 		host->caps2 |= MMC_CAP2_NO_SD;
 	if (device_property_read_bool(dev, "no-mmc"))
 		host->caps2 |= MMC_CAP2_NO_MMC;
+	if (device_property_read_bool(dev, "only-1-8-v"))
+		host->caps2 |= MMC_CAP2_ONLY_1V8_SIGNAL_VOLTAGE;
 
 	host->dsr_req = !device_property_read_u32(dev, "dsr", &host->dsr);
 	if (host->dsr_req && (host->dsr & ~0xffff)) {
@@ -439,8 +442,13 @@ int mmc_add_host(struct mmc_host *host)
 	mmc_add_host_debugfs(host);
 #endif
 
+#ifdef CONFIG_BLOCK
+	mmc_latency_hist_sysfs_init(host);
+#endif
+
 	mmc_start_host(host);
-	mmc_register_pm_notifier(host);
+	if (!(host->pm_flags & MMC_PM_IGNORE_PM_NOTIFY))
+		mmc_register_pm_notifier(host);
 
 	return 0;
 }
@@ -457,11 +465,16 @@ EXPORT_SYMBOL(mmc_add_host);
  */
 void mmc_remove_host(struct mmc_host *host)
 {
-	mmc_unregister_pm_notifier(host);
+	if (!(host->pm_flags & MMC_PM_IGNORE_PM_NOTIFY))
+		mmc_unregister_pm_notifier(host);
 	mmc_stop_host(host);
 
 #ifdef CONFIG_DEBUG_FS
 	mmc_remove_host_debugfs(host);
+#endif
+
+#ifdef CONFIG_BLOCK
+	mmc_latency_hist_sysfs_exit(host);
 #endif
 
 	device_del(&host->class_dev);

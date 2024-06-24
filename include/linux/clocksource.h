@@ -62,6 +62,7 @@ struct module;
  * @archdata:		arch-specific data
  * @suspend:		suspend function for the clocksource, if necessary
  * @resume:		resume function for the clocksource, if necessary
+ * @offset_ns:		the delta in ns from TSC to start of MONOTONIC_RAW
  * @owner:		module reference, must be set by clocksource in modules
  *
  * Note: This struct is not used in hotpathes of the timekeeping code
@@ -101,6 +102,7 @@ struct clocksource {
 	cycle_t cs_last;
 	cycle_t wd_last;
 #endif
+	u64 offset_ns;
 	struct module *owner;
 };
 
@@ -184,7 +186,7 @@ extern void clocksource_touch_watchdog(void);
 extern void clocksource_change_rating(struct clocksource *cs, int rating);
 extern void clocksource_suspend(void);
 extern void clocksource_resume(void);
-extern struct clocksource * __init clocksource_default_clock(void);
+extern struct clocksource * clocksource_default_clock(void);
 extern void clocksource_mark_unstable(struct clocksource *cs);
 
 extern u64

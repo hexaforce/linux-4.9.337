@@ -1390,7 +1390,7 @@ static int pfkey_getspi(struct sock *sk, struct sk_buff *skb, const struct sadb_
 	}
 
 	if (!x)
-		x = xfrm_find_acq(net, &dummy_mark, mode, reqid, proto, xdaddr, xsaddr, 1, family);
+		x = xfrm_find_acq(net, &dummy_mark, mode, reqid, 0, proto, xdaddr, xsaddr, 1, family);
 
 	if (x == NULL)
 		return -ENOENT;
@@ -2437,7 +2437,7 @@ static int pfkey_spddelete(struct sock *sk, struct sk_buff *skb, const struct sa
 			return err;
 	}
 
-	xp = xfrm_policy_bysel_ctx(net, &dummy_mark, XFRM_POLICY_TYPE_MAIN,
+	xp = xfrm_policy_bysel_ctx(net, &dummy_mark, 0, XFRM_POLICY_TYPE_MAIN,
 				   pol->sadb_x_policy_dir - 1, &sel, pol_ctx,
 				   1, &err);
 	security_xfrm_policy_free(pol_ctx);
@@ -2690,7 +2690,7 @@ static int pfkey_spdget(struct sock *sk, struct sk_buff *skb, const struct sadb_
 		return -EINVAL;
 
 	delete = (hdr->sadb_msg_type == SADB_X_SPDDELETE2);
-	xp = xfrm_policy_byid(net, &dummy_mark, XFRM_POLICY_TYPE_MAIN,
+	xp = xfrm_policy_byid(net, &dummy_mark, 0, XFRM_POLICY_TYPE_MAIN,
 			      dir, pol->sadb_x_policy_id, delete, &err);
 	if (xp == NULL)
 		return -ENOENT;
@@ -2976,10 +2976,9 @@ static int count_esp_combs(const struct xfrm_tmpl *t)
 	return sz + sizeof(struct sadb_prop);
 }
 
-static int dump_ah_combs(struct sk_buff *skb, const struct xfrm_tmpl *t)
+static void dump_ah_combs(struct sk_buff *skb, const struct xfrm_tmpl *t)
 {
 	struct sadb_prop *p;
-	int sz = 0;
 	int i;
 
 	p = (struct sadb_prop*)skb_put(skb, sizeof(struct sadb_prop));
@@ -3008,17 +3007,13 @@ static int dump_ah_combs(struct sk_buff *skb, const struct xfrm_tmpl *t)
 			c->sadb_comb_soft_addtime = 20*60*60;
 			c->sadb_comb_hard_usetime = 8*60*60;
 			c->sadb_comb_soft_usetime = 7*60*60;
-			sz += sizeof(*c);
 		}
 	}
-
-	return sz + sizeof(*p);
 }
 
-static int dump_esp_combs(struct sk_buff *skb, const struct xfrm_tmpl *t)
+static void dump_esp_combs(struct sk_buff *skb, const struct xfrm_tmpl *t)
 {
 	struct sadb_prop *p;
-	int sz = 0;
 	int i, k;
 
 	p = (struct sadb_prop*)skb_put(skb, sizeof(struct sadb_prop));
@@ -3060,11 +3055,8 @@ static int dump_esp_combs(struct sk_buff *skb, const struct xfrm_tmpl *t)
 			c->sadb_comb_soft_addtime = 20*60*60;
 			c->sadb_comb_hard_usetime = 8*60*60;
 			c->sadb_comb_soft_usetime = 7*60*60;
-			sz += sizeof(*c);
 		}
 	}
-
-	return sz + sizeof(*p);
 }
 
 static int key_notify_policy_expire(struct xfrm_policy *xp, const struct km_event *c)
@@ -3194,7 +3186,6 @@ static int pfkey_send_acquire(struct xfrm_state *x, struct xfrm_tmpl *t, struct 
 	struct sadb_x_sec_ctx *sec_ctx;
 	struct xfrm_sec_ctx *xfrm_ctx;
 	int ctx_size = 0;
-	int alg_size = 0;
 
 	sockaddr_size = pfkey_sockaddr_size(x->props.family);
 	if (!sockaddr_size)
@@ -3206,16 +3197,16 @@ static int pfkey_send_acquire(struct xfrm_state *x, struct xfrm_tmpl *t, struct 
 		sizeof(struct sadb_x_policy);
 
 	if (x->id.proto == IPPROTO_AH)
-		alg_size = count_ah_combs(t);
+		size += count_ah_combs(t);
 	else if (x->id.proto == IPPROTO_ESP)
-		alg_size = count_esp_combs(t);
+		size += count_esp_combs(t);
 
 	if ((xfrm_ctx = x->security)) {
 		ctx_size = PFKEY_ALIGN8(xfrm_ctx->ctx_len);
 		size +=  sizeof(struct sadb_x_sec_ctx) + ctx_size;
 	}
 
-	skb =  alloc_skb(size + alg_size + 16, GFP_ATOMIC);
+	skb =  alloc_skb(size + 16, GFP_ATOMIC);
 	if (skb == NULL)
 		return -ENOMEM;
 
@@ -3271,13 +3262,10 @@ static int pfkey_send_acquire(struct xfrm_state *x, struct xfrm_tmpl *t, struct 
 	pol->sadb_x_policy_priority = xp->priority;
 
 	/* Set sadb_comb's. */
-	alg_size = 0;
 	if (x->id.proto == IPPROTO_AH)
-		alg_size = dump_ah_combs(skb, t);
+		dump_ah_combs(skb, t);
 	else if (x->id.proto == IPPROTO_ESP)
-		alg_size = dump_esp_combs(skb, t);
-
-	hdr->sadb_msg_len += alg_size / 8;
+		dump_esp_combs(skb, t);
 
 	/* security context */
 	if (xfrm_ctx) {
