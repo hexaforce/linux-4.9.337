@@ -1,4 +1,3 @@
-
 #
 # Watchdog device configuration
 #
@@ -532,6 +531,7 @@ config MAX63XX_WATCHDOG
 config MAX77620_WATCHDOG
 	tristate "Maxim Max77620 Watchdog Timer"
 	depends on MFD_MAX77620
+	select WATCHDOG_CORE
 	help
 	 This is the driver for the Max77620 watchdog timer.
 	 Say 'Y' here to enable the watchdog timer support for
@@ -607,10 +607,14 @@ config ST_LPC_WATCHDOG
 	  To compile this driver as a module, choose M here: the
 	  module will be called st_lpc_wdt.
 
+config TEGRA_WATCHDOG_LEGACY
+	bool "Tegra Watchdog legacy Driver"
+
 config TEGRA_WATCHDOG
 	tristate "Tegra watchdog"
 	depends on (ARCH_TEGRA || COMPILE_TEST) && HAS_IOMEM
 	select WATCHDOG_CORE
+	select TEGRA_WATCHDOG_LEGACY
 	help
 	  Say Y here to include support for the watchdog timer
 	  embedded in NVIDIA Tegra SoCs.
@@ -1895,5 +1899,4 @@ config WATCHDOG_PRETIMEOUT_GOV_PANIC
 	  event put the kernel into panic.
 
 endif # WATCHDOG_PRETIMEOUT_GOV
-
 endif # WATCHDOG

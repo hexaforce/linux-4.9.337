@@ -639,7 +639,6 @@ static int configure_sync_endpoint(struct snd_usb_substream *subs)
 						   subs->pcm_format,
 						   subs->channels,
 						   subs->period_bytes,
-						   0, 0,
 						   subs->cur_rate,
 						   subs->cur_audiofmt,
 						   NULL);
@@ -679,7 +678,6 @@ static int configure_sync_endpoint(struct snd_usb_substream *subs)
 					  subs->pcm_format,
 					  sync_fp->channels,
 					  sync_period_bytes,
-					  0, 0,
 					  subs->cur_rate,
 					  sync_fp,
 					  NULL);
@@ -702,8 +700,6 @@ static int configure_endpoint(struct snd_usb_substream *subs)
 					  subs->pcm_format,
 					  subs->channels,
 					  subs->period_bytes,
-					  subs->period_frames,
-					  subs->buffer_periods,
 					  subs->cur_rate,
 					  subs->cur_audiofmt,
 					  subs->sync_endpoint);
@@ -740,8 +736,6 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
 
 	subs->pcm_format = params_format(hw_params);
 	subs->period_bytes = params_period_bytes(hw_params);
-	subs->period_frames = params_period_size(hw_params);
-	subs->buffer_periods = params_periods(hw_params);
 	subs->channels = params_channels(hw_params);
 	subs->cur_rate = params_rate(hw_params);
 
@@ -790,6 +784,20 @@ static int snd_usb_hw_free(struct snd_pcm_substream *substream)
 }
 
 /*
+ * to delay or sleep if running interval shorter then *intv*,
+ * time unit is in *ms*
+ */
+static void rest_if_interval_shorter_than(unsigned long intv,
+			unsigned long *last)
+{
+	if (last != 0 && time_before(jiffies, *last))
+		/* it should be in !in_atomic() context */
+		msleep(intv);
+
+	*last = jiffies + msecs_to_jiffies(intv);
+}
+
+/*
  * prepare callback
  *
  * only a few subtle things...
@@ -801,6 +809,9 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
 	struct usb_host_interface *alts;
 	struct usb_interface *iface;
 	int ret;
+
+	/* to prevent from short interval calling */
+	rest_if_interval_shorter_than(50, &subs->last_prepare);
 
 	if (! subs->cur_audiofmt) {
 		dev_err(&subs->dev->dev, "no format is specified!\n");
@@ -1474,7 +1485,6 @@ static void prepare_playback_urb(struct snd_usb_substream *subs,
 	frames = 0;
 	urb->number_of_packets = 0;
 	spin_lock_irqsave(&subs->lock, flags);
-	subs->frame_limit += ep->max_urb_frames;
 	for (i = 0; i < ctx->packets; i++) {
 		if (ctx->packet_size[i])
 			counts = ctx->packet_size[i];
@@ -1489,7 +1499,6 @@ static void prepare_playback_urb(struct snd_usb_substream *subs,
 		subs->transfer_done += counts;
 		if (subs->transfer_done >= runtime->period_size) {
 			subs->transfer_done -= runtime->period_size;
-			subs->frame_limit = 0;
 			period_elapsed = 1;
 			if (subs->fmt_type == UAC_FORMAT_TYPE_II) {
 				if (subs->transfer_done > 0) {
@@ -1512,10 +1521,8 @@ static void prepare_playback_urb(struct snd_usb_substream *subs,
 				break;
 			}
 		}
-		/* finish at the period boundary or after enough frames */
-		if ((period_elapsed ||
-				subs->transfer_done >= subs->frame_limit) &&
-		    !snd_usb_endpoint_implicit_feedback_sink(ep))
+		if (period_elapsed &&
+		    !snd_usb_endpoint_implicit_feedback_sink(subs->data_endpoint)) /* finish at the period boundary */
 			break;
 	}
 	bytes = frames * ep->stride;

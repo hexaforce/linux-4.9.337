@@ -75,6 +75,9 @@
 #define PCI_IO_START		(PCI_IO_END - PCI_IO_SIZE)
 #define FIXADDR_TOP		(PCI_IO_START - SZ_2M)
 
+/* The physical address of the end of vmemmap */
+#define VMEMMAP_END_PHYS	((VMEMMAP_SIZE >> STRUCT_PAGE_MAX_SHIFT) << PAGE_SHIFT)
+
 #define KERNEL_START      _text
 #define KERNEL_END        _end
 
@@ -152,6 +155,11 @@ extern u64			kimage_vaddr;
 /* the offset between the kernel virtual and physical mappings */
 extern u64			kimage_voffset;
 
+static inline unsigned long kaslr_offset(void)
+{
+	return kimage_vaddr - KIMAGE_VADDR;
+}
+
 /*
  * Allow all memory at the discovery stage. We will clip it later.
  */
@@ -192,6 +200,7 @@ static inline void *phys_to_virt(phys_addr_t x)
 #define __va(x)			((void *)__phys_to_virt((phys_addr_t)(x)))
 #define pfn_to_kaddr(pfn)	__va((pfn) << PAGE_SHIFT)
 #define virt_to_pfn(x)      __phys_to_pfn(__virt_to_phys(x))
+#define sym_to_pfn(x)	    __phys_to_pfn(__pa_symbol(x))
 
 /*
  *  virt_to_page(k)	convert a _valid_ virtual address to struct page *

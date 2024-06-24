@@ -340,7 +340,7 @@ cpuid_feature_extract_field(u64 features, int field, bool sign)
 {
 	return (sign) ?
 		cpuid_feature_extract_signed_field(features, field) :
-		cpuid_feature_extract_unsigned_field(features, field);
+		(int)cpuid_feature_extract_unsigned_field(features, field);
 }
 
 static inline s64 arm64_ftr_value(const struct arm64_ftr_bits *ftrp, u64 val)
@@ -408,6 +408,12 @@ static inline bool system_supports_32bit_el0(void)
 static inline bool system_supports_mixed_endian_el0(void)
 {
 	return id_aa64mmfr0_mixed_endian_el0(read_system_reg(SYS_ID_AA64MMFR0_EL1));
+}
+
+static inline bool system_uses_ttbr0_pan(void)
+{
+	return IS_ENABLED(CONFIG_ARM64_SW_TTBR0_PAN) &&
+		!cpus_have_cap(ARM64_HAS_PAN);
 }
 
 #define ARM64_SSBD_UNKNOWN		-1

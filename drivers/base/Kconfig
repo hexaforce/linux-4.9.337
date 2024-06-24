@@ -246,12 +246,20 @@ source "drivers/base/regmap/Kconfig"
 config DMA_SHARED_BUFFER
 	bool
 	default n
-	select ANON_INODES
 	help
 	  This option enables the framework for buffer-sharing between
 	  multiple drivers. A buffer is associated with a file using driver
 	  APIs extension; the file's descriptor can then be passed on to other
 	  driver.
+
+config DMABUF_DEFERRED_UNMAPPING
+	bool "Defer unmapping till shared DMA buffer is free"
+	default y
+	depends on DMA_SHARED_BUFFER
+	help
+	  This option enables the buffer-sharing framework to use deferred unmapping.
+	  Buffer mapping would be reused and kept repeatedly until dmabuf is freed.
+	  Dmabuf exporter can specify if it is compatible with this option.
 
 config FENCE_TRACE
 	bool "Enable verbose FENCE_TRACE messages"

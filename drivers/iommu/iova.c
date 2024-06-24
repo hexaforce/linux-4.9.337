@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/bitops.h>
+#include <linux/cpu.h>
 
 static bool iova_rcache_insert(struct iova_domain *iovad,
 			       unsigned long pfn,
@@ -56,16 +57,7 @@ EXPORT_SYMBOL_GPL(init_iova_domain);
 static struct rb_node *
 __get_cached_rbnode(struct iova_domain *iovad, unsigned long *limit_pfn)
 {
-	if ((*limit_pfn != iovad->dma_32bit_pfn) ||
-		(iovad->cached32_node == NULL))
-		return rb_last(&iovad->rbroot);
-	else {
-		struct rb_node *prev_node = rb_prev(iovad->cached32_node);
-		struct iova *curr_iova =
-			container_of(iovad->cached32_node, struct iova, node);
-		*limit_pfn = curr_iova->pfn_lo - 1;
-		return prev_node;
-	}
+	return rb_last(&iovad->rbroot);
 }
 
 static void
@@ -147,7 +139,7 @@ move_left:
 	if (!curr) {
 		if (size_aligned)
 			pad_size = iova_get_pad_size(size, limit_pfn);
-		if ((iovad->start_pfn + size + pad_size) > limit_pfn) {
+		if (iovad->start_pfn > limit_pfn - (size + pad_size) + 1) {
 			spin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);
 			return -ENOMEM;
 		}
@@ -156,6 +148,11 @@ move_left:
 	/* pfn_lo will point to size aligned address if size_aligned is set */
 	new->pfn_lo = limit_pfn - (size + pad_size) + 1;
 	new->pfn_hi = new->pfn_lo + size - 1;
+
+	if (new->pfn_lo > limit_pfn) {
+		spin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);
+		return -ENOMEM;
+	}
 
 	/* Insert the new_iova into domain rbtree by holding writer lock */
 	/* Add new node and rebalance tree. */
@@ -287,6 +284,20 @@ alloc_iova(struct iova_domain *iovad, unsigned long size,
 	struct iova *new_iova;
 	int ret;
 
+	if (limit_pfn > iovad->dma_32bit_pfn)
+		limit_pfn = iovad->dma_32bit_pfn;
+
+	/* WAR for APE linear map requirement:
+	 * APE binaries are statically linked and are dependent
+	 * on linear map to succeed. APE binaries are placed at
+	 * top of the IOVA space and allocation starts from
+	 * top as well. This causes linear map to fail.
+	 * Till APE binaries are moved to different IOVA,
+	 * This WAR is necessary.
+	 */
+	if (limit_pfn == 0x5ffff)
+		limit_pfn = 0x5e000;
+
 	new_iova = alloc_iova_mem();
 	if (!new_iova)
 		return NULL;
@@ -400,7 +411,7 @@ EXPORT_SYMBOL_GPL(free_iova);
 */
 unsigned long
 alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
-		unsigned long limit_pfn)
+		unsigned long limit_pfn, bool size_align)
 {
 	bool flushed_rcache = false;
 	unsigned long iova_pfn;
@@ -411,7 +422,7 @@ alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
 		return iova_pfn;
 
 retry:
-	new_iova = alloc_iova(iovad, size, limit_pfn, true);
+	new_iova = alloc_iova(iovad, size, limit_pfn, size_align);
 	if (!new_iova) {
 		unsigned int cpu;
 
@@ -420,10 +431,8 @@ retry:
 
 		/* Try replenishing IOVAs by flushing rcache. */
 		flushed_rcache = true;
-		preempt_disable();
 		for_each_online_cpu(cpu)
 			free_cpu_cached_iovas(cpu, iovad);
-		preempt_enable();
 		goto retry;
 	}
 
@@ -753,7 +762,7 @@ static bool __iova_rcache_insert(struct iova_domain *iovad,
 	bool can_insert = false;
 	unsigned long flags;
 
-	cpu_rcache = get_cpu_ptr(rcache->cpu_rcaches);
+	cpu_rcache = raw_cpu_ptr(rcache->cpu_rcaches);
 	spin_lock_irqsave(&cpu_rcache->lock, flags);
 
 	if (!iova_magazine_full(cpu_rcache->loaded)) {
@@ -783,7 +792,6 @@ static bool __iova_rcache_insert(struct iova_domain *iovad,
 		iova_magazine_push(cpu_rcache->loaded, iova_pfn);
 
 	spin_unlock_irqrestore(&cpu_rcache->lock, flags);
-	put_cpu_ptr(rcache->cpu_rcaches);
 
 	if (mag_to_free) {
 		iova_magazine_free_pfns(mag_to_free, iovad);
@@ -817,7 +825,7 @@ static unsigned long __iova_rcache_get(struct iova_rcache *rcache,
 	bool has_pfn = false;
 	unsigned long flags;
 
-	cpu_rcache = get_cpu_ptr(rcache->cpu_rcaches);
+	cpu_rcache = raw_cpu_ptr(rcache->cpu_rcaches);
 	spin_lock_irqsave(&cpu_rcache->lock, flags);
 
 	if (!iova_magazine_empty(cpu_rcache->loaded)) {
@@ -839,7 +847,6 @@ static unsigned long __iova_rcache_get(struct iova_rcache *rcache,
 		iova_pfn = iova_magazine_pop(cpu_rcache->loaded, limit_pfn);
 
 	spin_unlock_irqrestore(&cpu_rcache->lock, flags);
-	put_cpu_ptr(rcache->cpu_rcaches);
 
 	return iova_pfn;
 }

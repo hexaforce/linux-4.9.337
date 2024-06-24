@@ -4,7 +4,7 @@
  *
  *  Copyright(c) 2008-2010 Intel Corporation. All rights reserved.
  *  Copyright (c) 2006 ATI Technologies Inc.
- *  Copyright (c) 2008 NVIDIA Corp.  All rights reserved.
+ *  Copyright (c) 2008-2017, NVIDIA CORPORATION.  All rights reserved.
  *  Copyright (c) 2008 Wei Ni <wni@nvidia.com>
  *  Copyright (c) 2013 Anssi Hannula <anssi.hannula@iki.fi>
  *
@@ -44,6 +44,11 @@
 #include "hda_codec.h"
 #include "hda_local.h"
 #include "hda_jack.h"
+#include "hda_controller.h"
+
+#if IS_ENABLED(CONFIG_SND_HDA_TEGRA)
+#include <video/tegra_hdmi_audio.h>
+#endif
 
 static bool static_hdmi_pcm;
 module_param(static_hdmi_pcm, bool, 0644);
@@ -61,6 +66,17 @@ MODULE_PARM_DESC(static_hdmi_pcm, "Don't restrict PCM parameters per ELD info");
 #define is_valleyview(codec) ((codec)->core.vendor_id == 0x80862882)
 #define is_cherryview(codec) ((codec)->core.vendor_id == 0x80862883)
 #define is_valleyview_plus(codec) (is_valleyview(codec) || is_cherryview(codec))
+
+#define is_tegra21x(codec)  ((codec)->core.vendor_id == 0x10de0029)
+#define is_tegra_18x_sor0(codec)  ((codec)->core.vendor_id == 0x10de002d)
+#define is_tegra_18x_sor1(codec)  ((codec)->core.vendor_id == 0x10de002e)
+#define is_tegra_19x_sor2(codec)  ((codec)->core.vendor_id == 0x10de002f)
+#define is_tegra_19x_sor3(codec)  ((codec)->core.vendor_id == 0x10de0030)
+#define is_tegra_hdmi(codec) (is_tegra21x(codec) \
+				|| is_tegra_18x_sor0(codec) || is_tegra_18x_sor1(codec) \
+				|| is_tegra_19x_sor2(codec) || is_tegra_19x_sor3(codec))
+
+#define get_dev_id(codec)  ((codec)->core.vendor_id & 0xffff)
 
 struct hdmi_spec_per_cvt {
 	hda_nid_t cvt_nid;
@@ -191,7 +207,9 @@ struct dp_audio_infoframe {
 	u8 type; /* 0x84 */
 	u8 len;  /* 0x1b */
 	u8 ver;  /* 0x11 << 2 */
-
+#if IS_ENABLED(CONFIG_SND_HDA_TEGRA)
+	u8 checksum;
+#endif
 	u8 CC02_CT47;	/* match with HDMI infoframe from this on */
 	u8 SS01_SF24;
 	u8 CXT04;
@@ -837,7 +855,9 @@ static int hdmi_pin_hbr_setup(struct hda_codec *codec, hda_nid_t pin_nid,
 {
 	int pinctl, new_pinctl;
 
-	if (snd_hda_query_pin_caps(codec, pin_nid) & AC_PINCAP_HBR) {
+	/* Assuming the HW supports HBR for Tegra HDMI */
+	if ((snd_hda_query_pin_caps(codec, pin_nid) & AC_PINCAP_HBR) ||
+		(is_tegra_hdmi(codec))) {
 		pinctl = snd_hda_codec_read(codec, pin_nid, 0,
 					    AC_VERB_GET_PIN_WIDGET_CONTROL, 0);
 
@@ -1141,6 +1161,10 @@ static int hdmi_pcm_open(struct hda_pcm_stream *hinfo,
 	per_pin->cvt_nid = per_cvt->cvt_nid;
 	hinfo->nid = per_cvt->cvt_nid;
 
+	/* flip stripe flag for the assigned stream if supported */
+	if (get_wcaps(codec, per_cvt->cvt_nid) & AC_WCAP_STRIPE)
+		azx_stream(get_azx_dev(substream))->stripe = 1;
+
 	snd_hda_codec_write_cache(codec, per_pin->pin_nid, 0,
 			    AC_VERB_SET_CONNECT_SEL,
 			    per_pin->mux_idx);
@@ -1158,6 +1182,7 @@ static int hdmi_pcm_open(struct hda_pcm_stream *hinfo,
 	hinfo->maxbps = per_cvt->maxbps;
 
 	eld = &per_pin->sink_eld;
+
 	/* Restrict capabilities by ELD if this isn't disabled */
 	if (!static_hdmi_pcm && eld->eld_valid) {
 		snd_hdmi_eld_update_pcm_info(&eld->info, hinfo);
@@ -1434,6 +1459,9 @@ static bool hdmi_present_sense_via_verbs(struct hdmi_spec_per_pin *per_pin,
 						    eld->eld_size) < 0)
 				eld->eld_valid = false;
 		}
+
+		hdmi_update_lpcm_sad_eld(codec, pin_nid, eld);
+
 		if (!eld->eld_valid && repoll)
 			do_repoll = true;
 	}
@@ -1711,6 +1739,9 @@ static bool check_non_pcm_per_cvt(struct hda_codec *codec, hda_nid_t cvt_nid)
  * HDMI callbacks
  */
 
+#define is_pcm_format(format) \
+	((format & (1 << AC_FMT_TYPE_SHIFT)) == (AC_FMT_TYPE_PCM))
+
 static int generic_hdmi_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 					   struct hda_codec *codec,
 					   unsigned int stream_tag,
@@ -1724,7 +1755,7 @@ static int generic_hdmi_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 	hda_nid_t pin_nid;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	bool non_pcm;
-	int pinctl;
+	int pinctl, stripe;
 	int err = 0;
 
 	mutex_lock(&spec->pcm_lock);
@@ -1766,6 +1797,44 @@ static int generic_hdmi_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 	mutex_lock(&per_pin->lock);
 	per_pin->channels = substream->runtime->channels;
 	per_pin->setup = true;
+
+	if (get_wcaps(codec, cvt_nid) & AC_WCAP_STRIPE) {
+		stripe = snd_hdac_get_stream_stripe_ctl(&codec->bus->core,
+							substream);
+		snd_hda_codec_write(codec, cvt_nid, 0,
+					AC_VERB_SET_STRIPE_CONTROL,
+					stripe);
+	}
+
+#if IS_ENABLED(CONFIG_SND_HDA_TEGRA)
+	if (is_tegra_hdmi(codec)) {
+		int err = 0;
+		struct hdmi_eld *pin_eld = &per_pin->sink_eld;
+
+		if ((substream->runtime->channels == 2) &&
+			is_pcm_format(format))
+			tegra_hdmi_audio_null_sample_inject(true,
+							get_dev_id(codec));
+		else
+			tegra_hdmi_audio_null_sample_inject(false,
+							get_dev_id(codec));
+
+		/* Set hdmi:audio freq and source selection*/
+		err = tegra_hdmi_setup_audio_freq_source(
+					substream->runtime->rate, HDA,
+					get_dev_id(codec));
+		if ( err < 0 ) {
+			codec_dbg(codec,
+				"Unable to set hdmi audio freq to %d\n",
+						substream->runtime->rate);
+			if (pin_eld->monitor_present || pin_eld->eld_valid) {
+				mutex_unlock(&per_pin->lock);
+				mutex_unlock(&spec->pcm_lock);
+				return err;
+			}
+		}
+	}
+#endif
 
 	hdmi_setup_audio_infoframe(codec, per_pin, non_pcm);
 	mutex_unlock(&per_pin->lock);
@@ -1811,6 +1880,12 @@ static int hdmi_pcm_close(struct hda_pcm_stream *hinfo,
 			goto unlock;
 		}
 		cvt_idx = cvt_nid_to_cvt_index(codec, hinfo->nid);
+#if IS_ENABLED(CONFIG_SND_HDA_TEGRA) && IS_ENABLED(CONFIG_TEGRA_DC)
+		if (is_tegra_hdmi(codec)) {
+			tegra_hdmi_audio_null_sample_inject(false,
+							get_dev_id(codec));
+		}
+#endif
 		if (snd_BUG_ON(cvt_idx < 0)) {
 			err = -EINVAL;
 			goto unlock;
@@ -1819,6 +1894,8 @@ static int hdmi_pcm_close(struct hda_pcm_stream *hinfo,
 		snd_BUG_ON(!per_cvt->assigned);
 		per_cvt->assigned = 0;
 		hinfo->nid = 0;
+
+		azx_stream(get_azx_dev(substream))->stripe = 0;
 
 		snd_hda_spdif_ctls_unassign(codec, pcm_idx);
 		clear_bit(pcm_idx, &spec->pcm_in_use);
@@ -2043,6 +2120,12 @@ static int generic_hdmi_build_controls(struct hda_codec *codec)
 					get_pcm_rec(spec, pcm_idx)->device);
 		if (err < 0)
 			return err;
+
+		/* add control for custom ELD */
+		err = hdmi_create_custom_eld_ctl(codec, pcm_idx,
+					 get_pcm_rec(spec, pcm_idx)->device);
+		if (err < 0)
+			return err;
 	}
 
 	for (pin_idx = 0; pin_idx < spec->num_pins; pin_idx++) {
@@ -2072,6 +2155,10 @@ static int generic_hdmi_init_per_pins(struct hda_codec *codec)
 {
 	struct hdmi_spec *spec = codec->spec;
 	int pin_idx;
+
+	if (is_tegra_hdmi(codec))
+		snd_hda_codec_write(codec, 4, 0,
+				    AC_VERB_SET_DIGI_CONVERT_1, 0x11);
 
 	for (pin_idx = 0; pin_idx < spec->num_pins; pin_idx++) {
 		struct hdmi_spec_per_pin *per_pin = get_pin(spec, pin_idx);
@@ -3672,6 +3759,10 @@ HDA_CODEC_ENTRY(0x10de0020, "Tegra30 HDMI",	patch_tegra_hdmi),
 HDA_CODEC_ENTRY(0x10de0022, "Tegra114 HDMI",	patch_tegra_hdmi),
 HDA_CODEC_ENTRY(0x10de0028, "Tegra124 HDMI",	patch_tegra_hdmi),
 HDA_CODEC_ENTRY(0x10de0029, "Tegra210 HDMI/DP",	patch_tegra_hdmi),
+HDA_CODEC_ENTRY(0x10de002d, "Tegra18x SOR0",	patch_tegra_hdmi),
+HDA_CODEC_ENTRY(0x10de002e, "Tegra18x SOR1",	patch_tegra_hdmi),
+HDA_CODEC_ENTRY(0x10de002f, "Tegra19x SOR2",	patch_tegra_hdmi),
+HDA_CODEC_ENTRY(0x10de0030, "Tegra19x SOR3",	patch_tegra_hdmi),
 HDA_CODEC_ENTRY(0x10de0040, "GPU 40 HDMI/DP",	patch_nvhdmi),
 HDA_CODEC_ENTRY(0x10de0041, "GPU 41 HDMI/DP",	patch_nvhdmi),
 HDA_CODEC_ENTRY(0x10de0042, "GPU 42 HDMI/DP",	patch_nvhdmi),

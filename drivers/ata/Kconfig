@@ -170,6 +170,14 @@ config AHCI_SUNXI
 
 	  If unsure, say N.
 
+config AHCI_TEGRA_DOWNSTREAM
+	tristate "TEGRA AHCI SATA support"
+	select ARCH_TEGRA_HAS_SATA
+	help
+	  This option enables support for TEGRA AHCI Serial ATA.
+
+	  If unsure, say N.
+
 config AHCI_TEGRA
 	tristate "NVIDIA Tegra124 AHCI SATA support"
 	depends on ARCH_TEGRA

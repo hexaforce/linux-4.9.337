@@ -2,6 +2,7 @@
  * fs/direct-io.c
  *
  * Copyright (C) 2002, Linus Torvalds.
+ * Copyright (C) 2017, NVIDIA CORPORATION. All rights reserved.
  *
  * O_DIRECT
  *
@@ -613,6 +614,7 @@ static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
 	int ret;
 	sector_t fs_startblk;	/* Into file, in filesystem-sized blocks */
 	sector_t fs_endblk;	/* Into file, in filesystem-sized blocks */
+	long long startblk;	/* signed fs_startblk */
 	unsigned long fs_count;	/* Number of filesystem-sized blocks */
 	int create;
 	unsigned int i_blkbits = sdio->blkbits + sdio->blkfactor;
@@ -632,6 +634,12 @@ static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
 
 		map_bh->b_state = 0;
 		map_bh->b_size = fs_count << i_blkbits;
+
+		/*
+		 * Explicity casting fs_startblk (unsigned long long) to
+		 * signed long long for comparison later with inode size
+		 */
+		startblk = (long long) fs_startblk;
 
 		/*
 		 * For writes that could fill holes inside i_size on a

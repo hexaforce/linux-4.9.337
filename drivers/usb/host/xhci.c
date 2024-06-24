@@ -2,6 +2,7 @@
  * xHCI host controller driver
  *
  * Copyright (C) 2008 Intel Corp.
+ * Copyright (c) 2018-2019 NVIDIA CORPORATION.  All rights reserved.
  *
  * Author: Sarah Sharp
  * Some code borrowed from the Linux EHCI driver.
@@ -568,12 +569,21 @@ int xhci_init(struct usb_hcd *hcd)
 
 static int xhci_run_finished(struct xhci_hcd *xhci)
 {
+	u32 temp;
+
 	if (xhci_start(xhci)) {
 		xhci_halt(xhci);
 		return -ENODEV;
 	}
 	xhci->shared_hcd->state = HC_STATE_RUNNING;
 	xhci->cmd_ring_state = CMD_RING_STATE_RUNNING;
+
+	/* Set the HCD state before we enable the irqs */
+	temp = readl(&xhci->op_regs->command);
+	temp |= (CMD_EIE);
+	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+			"// Enable interrupts, cmd = 0x%x.", temp);
+	writel(temp, &xhci->op_regs->command);
 
 	if (xhci->quirks & XHCI_NEC_HOST)
 		xhci_ring_cmd_db(xhci);
@@ -641,13 +651,6 @@ int xhci_run(struct usb_hcd *hcd)
 	 */
 	temp |= (u32) ((xhci->quirks & XHCI_MTK_HOST) ? 20 : 160);
 	writel(temp, &xhci->ir_set->irq_control);
-
-	/* Set the HCD state before we enable the irqs */
-	temp = readl(&xhci->op_regs->command);
-	temp |= (CMD_EIE);
-	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-			"// Enable interrupts, cmd = 0x%x.", temp);
-	writel(temp, &xhci->op_regs->command);
 
 	temp = readl(&xhci->ir_set->irq_pending);
 	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
@@ -731,6 +734,8 @@ void xhci_stop(struct usb_hcd *hcd)
 			readl(&xhci->op_regs->status));
 	mutex_unlock(&xhci->mutex);
 }
+
+extern struct device_type pci_dev_type;
 
 /*
  * Shutdown HC (not bus-specific)
@@ -1536,6 +1541,7 @@ free_priv:
 	spin_unlock_irqrestore(&xhci->lock, flags);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(xhci_urb_enqueue);
 
 /*
  * Remove the URB's TD from the endpoint ring.  This may cause the HC to stop
@@ -1644,7 +1650,6 @@ int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 			goto done;
 		}
 		ep->ep_state |= EP_HALT_PENDING;
-		ep->stop_cmds_pending++;
 		ep->stop_cmd_timer.expires = jiffies +
 			XHCI_STOP_EP_CMD_TIMEOUT * HZ;
 		add_timer(&ep->stop_cmd_timer);
@@ -1858,6 +1863,7 @@ int xhci_add_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
 			(unsigned int) new_add_flags);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(xhci_add_endpoint);
 
 static void xhci_zero_in_ctx(struct xhci_hcd *xhci, struct xhci_virt_device *virt_dev)
 {
@@ -3717,6 +3723,7 @@ void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev)
 	 * associated with the slot.  XXX Can free sleep?
 	 */
 }
+EXPORT_SYMBOL_GPL(xhci_free_dev);
 
 /*
  * Checks if we have enough host controller resources for the default control
@@ -3832,6 +3839,7 @@ disable_slot:
 	spin_unlock_irqrestore(&xhci->lock, flags);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(xhci_alloc_dev);
 
 /*
  * Issue an Address Device command and optionally send a corresponding
@@ -4297,6 +4305,13 @@ static int xhci_check_usb2_port_capability(struct xhci_hcd *xhci, int port,
 			/* port offsets starts at 1 */
 			port_offset = XHCI_EXT_PORT_OFF(xhci->ext_caps[i]) - 1;
 			port_count = XHCI_EXT_PORT_COUNT(xhci->ext_caps[i]);
+
+			/* Convert from per hub port number to the xHC Root Hub
+			 * ports number (numbered from 1 to MaxPorts defined in
+			 * HCSPARAMS1 register)
+			 */
+			port += port_offset;
+
 			if (port >= port_offset &&
 			    port < port_offset + port_count)
 				return 1;
@@ -4332,6 +4347,7 @@ int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(xhci_update_device);
 
 /*---------------------- USB 3.0 Link PM functions ------------------------*/
 
@@ -4396,22 +4412,22 @@ static unsigned long long xhci_calculate_intel_u1_timeout(
 		struct usb_device *udev,
 		struct usb_endpoint_descriptor *desc)
 {
-	unsigned long long timeout_ns;
+	unsigned long long timeout_ns = udev->u1_params.sel;
 	int ep_type;
 	int intr_type;
 
 	ep_type = usb_endpoint_type(desc);
 	switch (ep_type) {
 	case USB_ENDPOINT_XFER_CONTROL:
-		timeout_ns = udev->u1_params.sel * 3;
+		timeout_ns *= 3;
 		break;
 	case USB_ENDPOINT_XFER_BULK:
-		timeout_ns = udev->u1_params.sel * 5;
+		timeout_ns *= 5;
 		break;
 	case USB_ENDPOINT_XFER_INT:
 		intr_type = usb_endpoint_interrupt_type(desc);
 		if (intr_type == USB_ENDPOINT_INTR_NOTIFICATION) {
-			timeout_ns = udev->u1_params.sel * 3;
+			timeout_ns *= 3;
 			break;
 		}
 		/* Otherwise the calculation is the same as isoc eps */
@@ -4447,6 +4463,14 @@ static u16 xhci_calculate_u1_timeout(struct xhci_hcd *xhci,
 		timeout_ns = xhci_calculate_intel_u1_timeout(udev, desc);
 	else
 		timeout_ns = udev->u1_params.sel;
+
+	/* Prevent U1 if service interval is shorter than U1 exit latency */
+	if (usb_endpoint_xfer_int(desc) || usb_endpoint_xfer_isoc(desc)) {
+		if (xhci_service_interval_to_ns(desc) <= timeout_ns) {
+			dev_dbg(&udev->dev, "Disable U1, ESIT shorter than exit latency\n");
+			return USB3_LPM_DISABLED;
+		}
+	}
 
 	/* The U1 timeout is encoded in 1us intervals.
 	 * Don't return a timeout of zero, because that's USB3_LPM_DISABLED.
@@ -4511,6 +4535,14 @@ static u16 xhci_calculate_u2_timeout(struct xhci_hcd *xhci,
 		timeout_ns = xhci_calculate_intel_u2_timeout(udev, desc);
 	else
 		timeout_ns = udev->u2_params.sel;
+
+	/* Prevent U2 if service interval is shorter than U2 exit latency */
+	if (usb_endpoint_xfer_int(desc) || usb_endpoint_xfer_isoc(desc)) {
+		if (xhci_service_interval_to_ns(desc) <= timeout_ns) {
+			dev_dbg(&udev->dev, "Disable U2, ESIT shorter than exit latency\n");
+			return USB3_LPM_DISABLED;
+		}
+	}
 
 	/* The U2 timeout is encoded in 256us intervals */
 	timeout_ns = DIV_ROUND_UP_ULL(timeout_ns, 256 * 1000);
@@ -4762,6 +4794,7 @@ int xhci_enable_usb3_lpm_timeout(struct usb_hcd *hcd,
 		return ret;
 	return hub_encoded_timeout;
 }
+EXPORT_SYMBOL_GPL(xhci_enable_usb3_lpm_timeout);
 
 int xhci_disable_usb3_lpm_timeout(struct usb_hcd *hcd,
 			struct usb_device *udev, enum usb3_link_state state)
@@ -4789,12 +4822,14 @@ int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
 {
 	return 0;
 }
+EXPORT_SYMBOL_GPL(xhci_update_device);
 
 int xhci_enable_usb3_lpm_timeout(struct usb_hcd *hcd,
 			struct usb_device *udev, enum usb3_link_state state)
 {
 	return USB3_LPM_DISABLED;
 }
+EXPORT_SYMBOL_GPL(xhci_enable_usb3_lpm_timeout);
 
 int xhci_disable_usb3_lpm_timeout(struct usb_hcd *hcd,
 			struct usb_device *udev, enum usb3_link_state state)
@@ -4802,7 +4837,6 @@ int xhci_disable_usb3_lpm_timeout(struct usb_hcd *hcd,
 	return 0;
 }
 #endif	/* CONFIG_PM */
-
 /*-------------------------------------------------------------------------*/
 
 /* Once a hub descriptor is fetched for a device, we need to update the xHC's
@@ -5124,7 +5158,6 @@ void xhci_init_driver(struct hc_driver *drv,
 	}
 }
 EXPORT_SYMBOL_GPL(xhci_init_driver);
-
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_LICENSE("GPL");

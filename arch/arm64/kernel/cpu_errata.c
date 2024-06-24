@@ -17,6 +17,7 @@
  */
 
 #include <linux/arm-smccc.h>
+#include <linux/moduleparam.h>
 #include <linux/psci.h>
 #include <linux/types.h>
 #include <asm/cachetype.h>
@@ -76,6 +77,8 @@ extern char __smccc_workaround_1_smc_start[];
 extern char __smccc_workaround_1_smc_end[];
 extern char __smccc_workaround_1_hvc_start[];
 extern char __smccc_workaround_1_hvc_end[];
+extern char __smccc_workaround_1_tegra_start[];
+extern char __smccc_workaround_1_tegra_end[];
 extern char __smccc_workaround_3_smc_start[];
 extern char __smccc_workaround_3_smc_end[];
 extern char __spectre_bhb_loop_k8_start[];
@@ -138,6 +141,8 @@ static void __install_bp_hardening_cb(bp_hardening_cb_t fn,
 #define __smccc_workaround_1_smc_end		NULL
 #define __smccc_workaround_1_hvc_start		NULL
 #define __smccc_workaround_1_hvc_end		NULL
+#define __smccc_workaround_1_tegra_start	NULL
+#define __smccc_workaround_1_tegra_end		NULL
 
 static void __install_bp_hardening_cb(bp_hardening_cb_t fn,
 				      const char *hyp_vecs_start,
@@ -166,8 +171,6 @@ static void  install_bp_hardening_cb(const struct arm64_cpu_capabilities *entry,
 }
 
 #include <uapi/linux/psci.h>
-#include <linux/arm-smccc.h>
-#include <linux/psci.h>
 
 static void call_smc_arch_workaround_1(void)
 {
@@ -177,6 +180,18 @@ static void call_smc_arch_workaround_1(void)
 static void call_hvc_arch_workaround_1(void)
 {
 	arm_smccc_1_1_hvc(ARM_SMCCC_ARCH_WORKAROUND_1, NULL);
+}
+
+/* A write of '1' to bit 0 of MSR [3, 0, 15, 0, 6]
+ *  * will cause the indirect branch predictor and RSB to be flushed.
+ *   */
+#define	NV_INDIRECT_BRANCH_PREDICTOR_AND_RSB_FLUSH 0x00000001UL
+
+static void call_tegra_arch_workaround_1(void)
+{
+	asm volatile("msr s3_0_c15_c0_6, %0\n":
+			:"r"(NV_INDIRECT_BRANCH_PREDICTOR_AND_RSB_FLUSH));
+	isb();
 }
 
 static void
@@ -221,6 +236,29 @@ enable_smccc_arch_workaround_1(const struct arm64_cpu_capabilities *entry)
 
 	return;
 }
+
+static void enable_tegra_smccc_arch_workaround_1(const struct arm64_cpu_capabilities *entry)
+{
+	u64 afr0_reg;
+	bool workaround_supported;
+
+	if (!entry->matches(entry, SCOPE_LOCAL_CPU))
+		return;
+
+	asm volatile("mrs %0, s3_0_c0_c5_4" : "=r" (afr0_reg));
+	workaround_supported = (((afr0_reg >> 16) & 0x0f) != 0);
+
+	if (workaround_supported) {
+		install_bp_hardening_cb(entry, call_tegra_arch_workaround_1,
+				__smccc_workaround_1_tegra_start,
+				__smccc_workaround_1_tegra_end);
+	} else {
+		enable_smccc_arch_workaround_1(entry);
+	}
+
+	return;
+}
+
 #endif	/* CONFIG_HARDEN_BRANCH_PREDICTOR */
 
 void __init arm64_update_smccc_conduit(struct alt_instr *alt,
@@ -448,6 +486,16 @@ static const struct midr_range arm64_bp_harden_smccc_cpus[] = {
 	{},
 };
 
+static const struct midr_range arm64_bp_harden_ic_iallu_on_smccc_cpus[] = {
+	MIDR_ALL_VERSIONS(MIDR_CORTEX_A57),
+	MIDR_ALL_VERSIONS(MIDR_CORTEX_A72),
+	{},
+};
+
+static const struct midr_range arm64_bp_harden_tegra_smccc_cpus[] = {
+	MIDR_ALL_VERSIONS(MIDR_NVIDIA_DENVER),
+	MIDR_ALL_VERSIONS(MIDR_NVIDIA_CARMEL),
+};
 #endif
 
 #ifdef CONFIG_ARM64_ERRATUM_1742098
@@ -547,9 +595,18 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 	},
 #ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
 	{
+		.capability = ARM64_IC_IALLU_ON_CTX_CHANGE,
+		ERRATA_MIDR_RANGE_LIST(arm64_bp_harden_ic_iallu_on_smccc_cpus),
+	},
+	{
 		.capability = ARM64_HARDEN_BRANCH_PREDICTOR,
 		ERRATA_MIDR_RANGE_LIST(arm64_bp_harden_smccc_cpus),
 		.cpu_enable = enable_smccc_arch_workaround_1,
+	},
+	{
+		.capability = ARM64_HARDEN_BRANCH_PREDICTOR,
+		ERRATA_MIDR_RANGE_LIST(arm64_bp_harden_tegra_smccc_cpus),
+		.cpu_enable = enable_tegra_smccc_arch_workaround_1,
 	},
 #endif
 #ifdef CONFIG_ARM64_SSBD
@@ -579,12 +636,25 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 	},
 #ifdef CONFIG_ARM64_ERRATUM_1742098
 	{
+		.desc = "Speculative Store Bypass Disable",
+		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+		.capability = ARM64_SSBD,
+		.matches = has_ssbd_mitigation,
 		.desc = "ARM erratum 1742098",
 		.capability = ARM64_WORKAROUND_1742098,
 		CAP_MIDR_RANGE_LIST(broken_aarch32_aes),
 		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
 	},
 #endif
+	{
+		.desc = "Spectre-BHB",
+		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+		.capability = ARM64_SPECTRE_BHB,
+		.matches = is_spectre_bhb_affected,
+#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
+		.cpu_enable = spectre_bhb_enable_mitigation,
+#endif
+	},
 	{
 	}
 };

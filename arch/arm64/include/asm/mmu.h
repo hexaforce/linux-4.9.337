@@ -16,7 +16,9 @@
 #ifndef __ASM_MMU_H
 #define __ASM_MMU_H
 
+
 #define USER_ASID_FLAG	(UL(1) << 48)
+#define TTBR_ASID_MASK	(UL(0xffff) << 48)
 
 #ifndef __ASSEMBLY__
 
@@ -91,6 +93,13 @@ extern void create_pgd_mapping(struct mm_struct *mm, phys_addr_t phys,
 			       unsigned long virt, phys_addr_t size,
 			       pgprot_t prot, bool allow_block_mappings);
 extern void *fixmap_remap_fdt(phys_addr_t dt_phys, int *size, pgprot_t prot);
+#ifdef CONFIG_MEMORY_HOTPLUG
+extern void hotplug_paging(phys_addr_t start, phys_addr_t size);
+#ifdef CONFIG_MEMORY_HOTREMOVE
+extern void remove_pagetable(unsigned long start,
+	unsigned long end, bool direct);
+#endif
+#endif
 
 #endif	/* !__ASSEMBLY__ */
 #endif

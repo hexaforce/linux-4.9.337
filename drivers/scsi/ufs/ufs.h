@@ -3,6 +3,7 @@
  *
  * This code is based on drivers/scsi/ufs/ufs.h
  * Copyright (C) 2011-2013 Samsung India Software Operations
+ * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * Authors:
  *	Santosh Yaraganavi <santosh.sy@samsung.com>
@@ -133,14 +134,20 @@ enum flag_idn {
 	QUERY_FLAG_IDN_FDEVICEINIT      = 0x01,
 	QUERY_FLAG_IDN_PWR_ON_WPE	= 0x03,
 	QUERY_FLAG_IDN_BKOPS_EN         = 0x04,
+	QUERY_FLAG_IDN_MAX		= 0x0E,
 };
 
 /* Attribute idn for Query requests */
 enum attr_idn {
+	QUERY_ATTR_IDN_BOOTLUN_EN	= 0x0,
+	QUERY_ATTR_IDN_PWR_MODE		= 0x02,
 	QUERY_ATTR_IDN_ACTIVE_ICC_LVL	= 0x03,
 	QUERY_ATTR_IDN_BKOPS_STATUS	= 0x05,
+	QUERY_ATTR_IDN_REF_CLK_FREQ	= 0x0A,
+	QUERY_ATTR_IDN_CONF_DESC_LCK	= 0x0B,
 	QUERY_ATTR_IDN_EE_CONTROL	= 0x0D,
 	QUERY_ATTR_IDN_EE_STATUS	= 0x0E,
+	QUERY_ATTR_IDN_MAX		= 0x30,
 };
 
 /* Descriptor idn for Query requests */
@@ -154,6 +161,7 @@ enum desc_idn {
 	QUERY_DESC_IDN_RFU_1		= 0x6,
 	QUERY_DESC_IDN_GEOMETRY		= 0x7,
 	QUERY_DESC_IDN_POWER		= 0x8,
+	QUERY_DESC_IDN_DEVICE_HEALTH	= 0x9,
 	QUERY_DESC_IDN_MAX,
 };
 

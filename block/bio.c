@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2001 Jens Axboe <axboe@kernel.dk>
+ * Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -512,7 +513,11 @@ struct bio *bio_alloc_bioset(gfp_t gfp_mask, int nr_iovecs, struct bio_set *bs)
 	return bio;
 
 err_free:
-	mempool_free(p, bs->bio_pool);
+	if (!bs)
+		kfree(bio);
+	else
+		mempool_free(p, bs->bio_pool);
+
 	return NULL;
 }
 EXPORT_SYMBOL(bio_alloc_bioset);
@@ -849,6 +854,9 @@ int bio_add_page(struct bio *bio, struct page *page,
 	bio->bi_vcnt++;
 done:
 	bio->bi_iter.bi_size += len;
+
+	if (!bio_flagged(bio, BIO_WORKINGSET) && unlikely(PageWorkingset(page)))
+		bio_set_flag(bio, BIO_WORKINGSET);
 	return len;
 }
 EXPORT_SYMBOL(bio_add_page);
@@ -1420,7 +1428,6 @@ static void __bio_unmap_user(struct bio *bio)
 void bio_unmap_user(struct bio *bio)
 {
 	__bio_unmap_user(bio);
-	bio_put(bio);
 }
 
 static void bio_map_kern_endio(struct bio *bio)

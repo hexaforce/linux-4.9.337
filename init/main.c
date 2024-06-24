@@ -574,6 +574,12 @@ asmlinkage __visible void __init start_kernel(void)
 	timekeeping_init();
 	time_init();
 
+	/* moving SYSTEM_BOOTING state
+	 * before this we were in SYSTEM_BOOTING_SINGLECORE
+	 */
+
+	system_state = SYSTEM_BOOTING;
+
 	/*
 	 * For best initial stack canary entropy, prepare it after:
 	 * - setup_arch() for any UEFI RNG entropy and boot cmdline access
@@ -585,7 +591,7 @@ asmlinkage __visible void __init start_kernel(void)
 	boot_init_stack_canary();
 
 	sched_clock_postinit();
-	printk_nmi_init();
+	printk_safe_init();
 	perf_event_init();
 	profile_init();
 	call_function_init();
@@ -1030,6 +1036,9 @@ static noinline void __init kernel_init_freeable(void)
 	do_pre_smp_initcalls();
 	lockup_detector_init();
 
+	/* before this point, we were in SYSTEM_BOOTING_SINGLECORE */
+	system_state = SYSTEM_BOOTING;
+
 	smp_init();
 	sched_init_smp();
 
@@ -1047,7 +1056,7 @@ static noinline void __init kernel_init_freeable(void)
 	 * check if there is an early userspace init.  If yes, let it do all
 	 * the work
 	 */
-
+#ifndef CONFIG_DIAG_KERNEL
 	if (!ramdisk_execute_command)
 		ramdisk_execute_command = "/init";
 
@@ -1055,6 +1064,10 @@ static noinline void __init kernel_init_freeable(void)
 		ramdisk_execute_command = NULL;
 		prepare_namespace();
 	}
+#else
+	pr_info("kernel-init: Diag: It's diag image, start diag kernel init.\n");
+	prepare_namespace();
+#endif
 
 	/*
 	 * Ok, we have completed the initial bootup, and

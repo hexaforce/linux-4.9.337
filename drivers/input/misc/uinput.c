@@ -556,6 +556,9 @@ static ssize_t uinput_inject_events(struct uinput_device *udev,
 		 */
 		if (input_event_from_user(buffer + bytes, &ev))
 			return -EFAULT;
+		if ((ev.type == EV_ABS) &&
+				(ev.code >= (ABS_MT_LAST + ABS_MT_FIRST)))
+			return -EINVAL;
 
 		input_event(udev->dev, ev.type, ev.code, ev.value);
 		bytes += input_event_size();
@@ -806,7 +809,7 @@ static int uinput_str_to_user(void __user *dest, const char *str,
 static long uinput_ioctl_handler(struct file *file, unsigned int cmd,
 				 unsigned long arg, void __user *p)
 {
-	int			retval;
+	long			retval;
 	struct uinput_device	*udev = file->private_data;
 	struct uinput_ff_upload ff_up;
 	struct uinput_ff_erase  ff_erase;

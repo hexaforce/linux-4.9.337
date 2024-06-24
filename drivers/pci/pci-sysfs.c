@@ -1594,3 +1594,4 @@ static const struct attribute_group *pci_dev_attr_groups[] = {
 struct device_type pci_dev_type = {
 	.groups = pci_dev_attr_groups,
 };
+EXPORT_SYMBOL(pci_dev_type);

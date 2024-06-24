@@ -37,6 +37,9 @@ static inline int tty_insert_flip_string(struct tty_port *port,
 
 extern void tty_buffer_lock_exclusive(struct tty_port *port);
 extern void tty_buffer_unlock_exclusive(struct tty_port *port);
+extern int tty_buffer_get_level(struct tty_port *port);
+extern int tty_buffer_get_count(struct tty_port *port);
+extern int n_tty_buffer_get_count(struct tty_struct *tty);
 
 int tty_insert_flip_string_and_push_buffer(struct tty_port *port,
 		const unsigned char *chars, size_t cnt);

@@ -258,7 +258,7 @@ struct fuse_io_priv {
 
 #define FUSE_IO_PRIV_SYNC(f) \
 {					\
-	.refcnt = { ATOMIC_INIT(1) },	\
+	.refcnt = KREF_INIT(1),		\
 	.async = 0,			\
 	.file = f,			\
 }
@@ -371,6 +371,9 @@ struct fuse_req {
 
 	/** Inode used in the request or NULL */
 	struct inode *inode;
+
+	/** Path used for completing d_canonical_path */
+	struct path *canonical_path;
 
 	/** AIO control block */
 	struct fuse_io_priv *io;

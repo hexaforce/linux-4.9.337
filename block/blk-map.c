@@ -39,6 +39,8 @@ static int __blk_rq_unmap_user(struct bio *bio)
 			bio_unmap_user(bio);
 		else
 			ret = bio_uncopy_user(bio);
+
+		bio_put(bio);
 	}
 
 	return ret;
@@ -183,13 +185,10 @@ int blk_rq_unmap_user(struct bio *bio)
 		if (unlikely(bio_flagged(bio, BIO_BOUNCED)))
 			mapped_bio = bio->bi_private;
 
+		bio = bio->bi_next;
 		ret2 = __blk_rq_unmap_user(mapped_bio);
 		if (ret2 && !ret)
 			ret = ret2;
-
-		mapped_bio = bio;
-		bio = bio->bi_next;
-		bio_put(mapped_bio);
 	}
 
 	return ret;

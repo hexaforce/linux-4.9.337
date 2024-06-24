@@ -45,6 +45,7 @@
 #include <linux/swap.h>
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
+#include <linux/memremap.h>
 #include <linux/ksm.h>
 #include <linux/rmap.h>
 #include <linux/export.h>
@@ -761,8 +762,8 @@ static void print_bad_pte(struct vm_area_struct *vma, unsigned long addr,
 #else
 # define HAVE_PTE_SPECIAL 0
 #endif
-struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
-				pte_t pte)
+struct page *_vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
+			     pte_t pte, bool with_public_device)
 {
 	unsigned long pfn = pte_pfn(pte);
 
@@ -773,8 +774,31 @@ struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
 			return vma->vm_ops->find_special_page(vma, addr);
 		if (vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))
 			return NULL;
-		if (!is_zero_pfn(pfn))
-			print_bad_pte(vma, addr, pte, NULL);
+		if (is_zero_pfn(pfn))
+			return NULL;
+
+		/*
+		 * Device public pages are special pages (they are ZONE_DEVICE
+		 * pages but different from persistent memory). They behave
+		 * allmost like normal pages. The difference is that they are
+		 * not on the lru and thus should never be involve with any-
+		 * thing that involve lru manipulation (mlock, numa balancing,
+		 * ...).
+		 *
+		 * This is why we still want to return NULL for such page from
+		 * vm_normal_page() so that we do not have to special case all
+		 * call site of vm_normal_page().
+		 */
+		if (likely(pfn < highest_memmap_pfn)) {
+			struct page *page = pfn_to_page(pfn);
+
+			if (is_device_public_page(page)) {
+				if (with_public_device)
+					return page;
+				return NULL;
+			}
+		}
+		print_bad_pte(vma, addr, pte, NULL);
 		return NULL;
 	}
 
@@ -900,6 +924,35 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 					pte = pte_swp_mksoft_dirty(pte);
 				set_pte_at(src_mm, addr, src_pte, pte);
 			}
+		} else if (is_device_private_entry(entry)) {
+			page = device_private_entry_to_page(entry);
+
+			/*
+			 * Update rss count even for unaddressable pages, as
+			 * they should treated just like normal pages in this
+			 * respect.
+			 *
+			 * We will likely want to have some new rss counters
+			 * for unaddressable pages, at some point. But for now
+			 * keep things as they are.
+			 */
+			get_page(page);
+			rss[mm_counter(page)]++;
+			page_dup_rmap(page, false);
+
+			/*
+			 * We do not preserve soft-dirty information, because so
+			 * far, checkpoint/restore is the only feature that
+			 * requires that. And checkpoint/restore does not work
+			 * when a device driver is involved (you cannot easily
+			 * save and restore device driver state).
+			 */
+			if (is_write_device_private_entry(entry) &&
+			    is_cow_mapping(vm_flags)) {
+				make_device_private_entry_read(&entry);
+				pte = swp_entry_to_pte(entry);
+				set_pte_at(src_mm, addr, src_pte, pte);
+			}
 		}
 		goto out_set_pte;
 	}
@@ -926,6 +979,19 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 		get_page(page);
 		page_dup_rmap(page, false);
 		rss[mm_counter(page)]++;
+	} else if (pte_devmap(pte)) {
+		page = pte_page(pte);
+
+		/*
+		 * Cache coherent device memory behave like regular page and
+		 * not like persistent memory page. For more informations see
+		 * MEMORY_DEVICE_CACHE_COHERENT in memory_hotplug.h
+		 */
+		if (is_device_public_page(page)) {
+			get_page(page);
+			page_dup_rmap(page, false);
+			rss[mm_counter(page)]++;
+		}
 	}
 
 out_set_pte:
@@ -1158,7 +1224,7 @@ again:
 		if (pte_present(ptent)) {
 			struct page *page;
 
-			page = vm_normal_page(vma, addr, ptent);
+			page = _vm_normal_page(vma, addr, ptent, true);
 			if (unlikely(details) && page) {
 				/*
 				 * unmap_shared_mapping_pages() wants to
@@ -1204,10 +1270,32 @@ again:
 		}
 
 		entry = pte_to_swp_entry(ptent);
+		if (non_swap_entry(entry) && is_device_private_entry(entry)) {
+			struct page *page = device_private_entry_to_page(entry);
+
+			if (unlikely(details && details->check_mapping)) {
+				/*
+				 * unmap_shared_mapping_pages() wants to
+				 * invalidate cache without truncating:
+				 * unmap shared but keep private pages.
+				 */
+				if (details->check_mapping !=
+				    page_rmapping(page))
+					continue;
+			}
+
+			pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+			rss[mm_counter(page)]--;
+			page_remove_rmap(page, false);
+			put_page(page);
+			continue;
+		}
+
+		/* only check swap_entries if explicitly asked for in details */
+		if (unlikely(details && !details->check_swap_entries))
+			continue;
+
 		if (!non_swap_entry(entry)) {
-			/* Genuine swap entry, hence a private anon page */
-			if (!should_zap_cows(details))
-				continue;
 			rss[MM_SWAPENTS]--;
 		} else if (is_migration_entry(entry)) {
 			struct page *page;
@@ -2182,7 +2270,7 @@ static inline int wp_page_reuse(struct fault_env *fe, pte_t orig_pte,
  * - In any case, unlock the PTL and drop the reference we took to the old page.
  */
 static int wp_page_copy(struct fault_env *fe, pte_t orig_pte,
-		struct page *old_page)
+		struct page *old_page, unsigned int flags)
 {
 	struct vm_area_struct *vma = fe->vma;
 	struct mm_struct *mm = vma->vm_mm;
@@ -2192,16 +2280,20 @@ static int wp_page_copy(struct fault_env *fe, pte_t orig_pte,
 	const unsigned long mmun_start = fe->address & PAGE_MASK;
 	const unsigned long mmun_end = mmun_start + PAGE_SIZE;
 	struct mem_cgroup *memcg;
+	gfp_t gfp = GFP_HIGHUSER_MOVABLE;
+
+	if (IS_ENABLED(CONFIG_CMA) && (flags & FAULT_FLAG_NO_CMA))
+		gfp &= ~__GFP_MOVABLE;
 
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
 
 	if (is_zero_pfn(pte_pfn(orig_pte))) {
-		new_page = alloc_zeroed_user_highpage_movable(vma, fe->address);
+		new_page = alloc_zeroed_user_highpage(gfp, vma, fe->address);
 		if (!new_page)
 			goto oom;
 	} else {
-		new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
+		new_page = alloc_page_vma(gfp, vma,
 				fe->address);
 		if (!new_page)
 			goto oom;
@@ -2402,7 +2494,7 @@ static int wp_page_shared(struct fault_env *fe, pte_t orig_pte,
  * but allow concurrent faults), with pte both mapped and locked.
  * We return with mmap_sem still held, but pte unmapped and unlocked.
  */
-static int do_wp_page(struct fault_env *fe, pte_t orig_pte)
+static int do_wp_page(struct fault_env *fe, pte_t orig_pte, unsigned int flags)
 	__releases(fe->ptl)
 {
 	struct vm_area_struct *vma = fe->vma;
@@ -2422,7 +2514,7 @@ static int do_wp_page(struct fault_env *fe, pte_t orig_pte)
 			return wp_pfn_shared(fe, orig_pte);
 
 		pte_unmap_unlock(fe->pte, fe->ptl);
-		return wp_page_copy(fe, orig_pte, old_page);
+		return wp_page_copy(fe, orig_pte, old_page, flags);
 	}
 
 	/*
@@ -2471,7 +2563,7 @@ static int do_wp_page(struct fault_env *fe, pte_t orig_pte)
 	get_page(old_page);
 
 	pte_unmap_unlock(fe->pte, fe->ptl);
-	return wp_page_copy(fe, orig_pte, old_page);
+	return wp_page_copy(fe, orig_pte, old_page, flags);
 }
 
 static void unmap_mapping_range_vma(struct vm_area_struct *vma,
@@ -2577,6 +2669,14 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
 	if (unlikely(non_swap_entry(entry))) {
 		if (is_migration_entry(entry)) {
 			migration_entry_wait(vma->vm_mm, fe->pmd, fe->address);
+		} else if (is_device_private_entry(entry)) {
+			/*
+			 * For un-addressable device memory we call the pgmap
+			 * fault handler callback. The callback must migrate
+			 * the page back to some CPU accessible page.
+			 */
+			ret = device_private_entry_fault(vma, fe->address, entry,
+							 fe->flags, fe->pmd);
 		} else if (is_hwpoison_entry(entry)) {
 			ret = VM_FAULT_HWPOISON;
 		} else {
@@ -2714,7 +2814,7 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
 	}
 
 	if (fe->flags & FAULT_FLAG_WRITE) {
-		ret |= do_wp_page(fe, pte);
+		ret |= do_wp_page(fe, pte, fe->flags);
 		if (ret & VM_FAULT_ERROR)
 			ret &= VM_FAULT_ERROR;
 		goto out;
@@ -2739,6 +2839,8 @@ out_release:
 	}
 	return ret;
 }
+
+bool is_vma_temporary_stack(struct vm_area_struct *vma);
 
 /*
  * We enter with non-exclusive mmap_sem (to exclude vma changes,
@@ -2793,7 +2895,12 @@ static int do_anonymous_page(struct fault_env *fe)
 	/* Allocate our own private page. */
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
-	page = alloc_zeroed_user_highpage_movable(vma, fe->address);
+	if (vma->vm_flags & VM_LOCKED || vma->vm_flags & FAULT_FLAG_NO_CMA ||
+	    is_vma_temporary_stack(vma)) {
+		page = alloc_zeroed_user_highpage(GFP_HIGHUSER, vma, fe->address);
+	} else {
+		page = alloc_zeroed_user_highpage_movable(vma, fe->address);
+	}
 	if (!page)
 		goto oom;
 
@@ -3335,8 +3442,10 @@ static int do_shared_fault(struct fault_env *fe, pgoff_t pgoff)
 		return ret;
 	}
 
-	if (set_page_dirty(fault_page))
-		dirtied = 1;
+	/* There's no need to set anon page dirty. */
+	if (!PageAnon(fault_page))
+		if (set_page_dirty(fault_page))
+			dirtied = 1;
 	/*
 	 * Take a local copy of the address_space - page.mapping may be zeroed
 	 * by truncate after unlock_page().   The address_space itself remains
@@ -3542,6 +3651,8 @@ static inline bool vma_is_accessible(struct vm_area_struct *vma)
 static int handle_pte_fault(struct fault_env *fe)
 {
 	pte_t entry;
+	pteval_t prot_vm_none = pgprot_val(vm_get_page_prot(VM_NONE));
+	bool fix_prot = false;
 
 	if (unlikely(pmd_none(*fe->pmd))) {
 		/*
@@ -3593,13 +3704,29 @@ static int handle_pte_fault(struct fault_env *fe)
 	if (pte_protnone(entry) && vma_is_accessible(fe->vma))
 		return do_numa_page(fe, entry);
 
+	if (fe->vma->vm_ops && fe->vma->vm_ops->fixup_prot &&
+		fe->vma->vm_ops->fault &&
+		((prot_vm_none & pte_val(entry)) == prot_vm_none)) {
+		pgoff_t pgoff = (((fe->address & PAGE_MASK)
+				- fe->vma->vm_start) >> PAGE_SHIFT) +
+				fe->vma->vm_pgoff;
+		if (!fe->vma->vm_ops->fixup_prot(fe->vma,
+				fe->address & PAGE_MASK, pgoff))
+			return VM_FAULT_SIGSEGV; /* access not granted */
+		fix_prot = true;
+	}
 	fe->ptl = pte_lockptr(fe->vma->vm_mm, fe->pmd);
 	spin_lock(fe->ptl);
 	if (unlikely(!pte_same(*fe->pte, entry)))
 		goto unlock;
+	if (fix_prot) {
+		entry = pte_modify(entry, fe->vma->vm_page_prot);
+		vm_stat_account(fe->vma->vm_mm, VM_NONE, -1);
+		vm_stat_account(fe->vma->vm_mm, fe->vma->vm_flags, 1);
+	}
 	if (fe->flags & FAULT_FLAG_WRITE) {
 		if (!pte_write(entry))
-			return do_wp_page(fe, entry);
+			return do_wp_page(fe, entry, fe->flags);
 		entry = pte_mkdirty(entry);
 	}
 	entry = pte_mkyoung(entry);

@@ -638,6 +638,7 @@ int usb_match_device(struct usb_device *dev, const struct usb_device_id *id)
 
 	return 1;
 }
+EXPORT_SYMBOL(usb_match_device);
 
 /* returns 0 if no match, 1 if match */
 int usb_match_one_id_intf(struct usb_device *dev,
@@ -1062,7 +1063,7 @@ static void usb_rebind_intf(struct usb_interface *intf)
 	if (!intf->dev.power.is_prepared) {
 		intf->needs_binding = 0;
 		rc = device_attach(&intf->dev);
-		if (rc < 0)
+		if (rc < 0 && rc != -EPROBE_DEFER)
 			dev_warn(&intf->dev, "rebind failed: %d\n", rc);
 	}
 }
@@ -1365,7 +1366,8 @@ static int usb_suspend_both(struct usb_device *udev, pm_message_t msg)
 	}
 
  done:
-	dev_vdbg(&udev->dev, "%s: status %d\n", __func__, status);
+	if (status != -EBUSY)
+		dev_info(&udev->dev, "%s: status %d\n", __func__, status);
 	return status;
 }
 

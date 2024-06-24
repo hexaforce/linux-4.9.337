@@ -3,6 +3,7 @@
  * xHCI host controller driver
  *
  * Copyright (C) 2008 Intel Corp.
+ * Copyright (c) 2018 NVIDIA CORPORATION.  All rights reserved.
  *
  * Author: Sarah Sharp
  * Some code borrowed from the Linux EHCI driver.
@@ -314,6 +315,8 @@ struct xhci_op_regs {
 #define XDEV_U1		(0x1 << 5)
 #define XDEV_U2		(0x2 << 5)
 #define XDEV_U3		(0x3 << 5)
+#define XDEV_DISABLED	(0x4 << 5)
+#define XDEV_RXDETECT	(0x5 << 5)
 #define XDEV_INACTIVE	(0x6 << 5)
 #define XDEV_POLLING	(0x7 << 5)
 #define XDEV_RECOVERY	(0x8 << 5)
@@ -932,7 +935,6 @@ struct xhci_virt_ep {
 	unsigned int		stopped_stream;
 	/* Watchdog timer for stop endpoint command to cancel URBs */
 	struct timer_list	stop_cmd_timer;
-	int			stop_cmds_pending;
 	struct xhci_hcd		*xhci;
 	/* Dequeue pointer and dequeue segment for a submitted Set TR Dequeue
 	 * command.  We'll need to update the ring's dequeue segment and dequeue
@@ -1529,6 +1531,11 @@ struct xhci_hub {
 	u8	psi_uid_count;
 };
 
+struct xhci_err_cnt {
+	unsigned int version;
+	unsigned int comp_tx_err;
+};
+
 /* There is one xhci_hcd structure per controller */
 struct xhci_hcd {
 	struct usb_hcd *main_hcd;
@@ -1696,8 +1703,13 @@ struct xhci_hcd {
 /* Compliance Mode Timer Triggered every 2 seconds */
 #define COMP_MODE_RCVRY_MSECS 2000
 
+	struct  work_struct	tegra_xhci_reinit_work;
+	bool	recovery_in_progress;
+	struct platform_device *pdev;
 	/* platform-specific data -- must come last */
 	unsigned long		priv[0] __aligned(sizeof(s64));
+	/* Error collecting struct for sysfs */
+	struct xhci_err_cnt xhci_ereport;
 };
 
 /* Platform specific overrides to generic XHCI hc_driver ops */
@@ -1731,6 +1743,8 @@ static inline struct usb_hcd *xhci_to_hcd(struct xhci_hcd *xhci)
 	dev_dbg(xhci_to_hcd(xhci)->self.controller , fmt , ## args)
 #define xhci_err(xhci, fmt, args...) \
 	dev_err(xhci_to_hcd(xhci)->self.controller , fmt , ## args)
+#define xhci_err_ratelimited(xhci, fmt, args...) \
+	dev_err_ratelimited(xhci_to_hcd(xhci)->self.controller, fmt, ## args)
 #define xhci_warn(xhci, fmt, args...) \
 	dev_warn(xhci_to_hcd(xhci)->self.controller , fmt , ## args)
 #define xhci_warn_ratelimited(xhci, fmt, args...) \
@@ -2003,5 +2017,9 @@ static inline struct xhci_ring *xhci_urb_to_transfer_ring(struct xhci_hcd *xhci,
 					xhci_get_endpoint_index(&urb->ep->desc),
 					urb->stream_id);
 }
+
+#ifdef CONFIG_USB_OTG_WAKELOCK
+extern void otgwl_acquire_temp_lock(void);
+#endif
 
 #endif /* __LINUX_XHCI_HCD_H */

@@ -131,6 +131,9 @@ static void __uart_start(struct tty_struct *tty)
 	struct uart_state *state = tty->driver_data;
 	struct uart_port *port = state->uart_port;
 
+	if (port && port->ops->wake_peer)
+		port->ops->wake_peer(port);
+
 	if (port && !uart_tx_stopped(port))
 		port->ops->start_tx(port);
 }
@@ -2734,6 +2737,38 @@ static ssize_t uart_get_attr_iomem_reg_shift(struct device *dev,
 	return snprintf(buf, PAGE_SIZE, "%d\n", tmp.iomem_reg_shift);
 }
 
+static ssize_t uart_get_attr_rt_flush(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", uport->rt_flush);
+}
+
+static ssize_t uart_set_attr_rt_flush(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int enable = simple_strtoul(buf, NULL, 0);
+	int r = 0;
+
+	mutex_lock(&port->mutex);
+	if (enable) {
+		if (IS_ERR_OR_NULL(port->tty_kthread))
+			r = tty_buffer_start_rt_thread(port, uport->line);
+	} else {
+		tty_buffer_stop_rt_thread(port);
+	}
+	if (r)
+		dev_err(dev, "cannot set rt_flush_attribute: %d\n", r);
+	mutex_unlock(&port->mutex);
+	return count;
+}
+
 static DEVICE_ATTR(type, S_IRUSR | S_IRGRP, uart_get_attr_type, NULL);
 static DEVICE_ATTR(line, S_IRUSR | S_IRGRP, uart_get_attr_line, NULL);
 static DEVICE_ATTR(port, S_IRUSR | S_IRGRP, uart_get_attr_port, NULL);
@@ -2747,6 +2782,7 @@ static DEVICE_ATTR(custom_divisor, S_IRUSR | S_IRGRP, uart_get_attr_custom_divis
 static DEVICE_ATTR(io_type, S_IRUSR | S_IRGRP, uart_get_attr_io_type, NULL);
 static DEVICE_ATTR(iomem_base, S_IRUSR | S_IRGRP, uart_get_attr_iomem_base, NULL);
 static DEVICE_ATTR(iomem_reg_shift, S_IRUSR | S_IRGRP, uart_get_attr_iomem_reg_shift, NULL);
+static DEVICE_ATTR(rt_flush, S_IRUSR | S_IWUSR | S_IRGRP, uart_get_attr_rt_flush, uart_set_attr_rt_flush);
 
 static struct attribute *tty_dev_attrs[] = {
 	&dev_attr_type.attr,
@@ -2762,6 +2798,7 @@ static struct attribute *tty_dev_attrs[] = {
 	&dev_attr_io_type.attr,
 	&dev_attr_iomem_base.attr,
 	&dev_attr_iomem_reg_shift.attr,
+	&dev_attr_rt_flush.attr,
 	NULL,
 	};
 
@@ -2784,6 +2821,7 @@ int uart_add_one_port(struct uart_driver *drv, struct uart_port *uport)
 	struct uart_state *state;
 	struct tty_port *port;
 	int ret = 0;
+	int ret_rt = 0;
 	struct device *tty_dev;
 	int num_groups;
 
@@ -2853,6 +2891,15 @@ int uart_add_one_port(struct uart_driver *drv, struct uart_port *uport)
 	} else {
 		dev_err(uport->dev, "Cannot register tty device on line %d\n",
 		       uport->line);
+	}
+
+	if (uport->rt_flush) {
+		ret_rt = tty_buffer_start_rt_thread(port, uport->line);
+		if (ret_rt < 0) {
+			dev_err(uport->dev,
+				"cannot start RT thread on line %d: %d",
+				uport->line, ret_rt);
+		}
 	}
 
 	/*

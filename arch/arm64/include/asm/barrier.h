@@ -30,6 +30,7 @@
 #define isb()		asm volatile("isb" : : : "memory")
 #define dmb(opt)	asm volatile("dmb " #opt : : : "memory")
 #define dsb(opt)	asm volatile("dsb " #opt : : : "memory")
+#define csdb()		asm volatile("hint #20" : : : "memory")
 
 #define csdb()		asm volatile("hint #20" : : : "memory")
 
@@ -139,6 +140,10 @@ do {									\
 	}								\
 	VAL;								\
 })
+
+#define speculation_barrier()						\
+	asm volatile(   "dsb sy\n"					\
+			"isb\n" : : : "memory")
 
 #include <asm-generic/barrier.h>
 

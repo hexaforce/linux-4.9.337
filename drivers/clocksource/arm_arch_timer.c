@@ -29,6 +29,7 @@
 
 #include <asm/arch_timer.h>
 #include <asm/virt.h>
+#include <asm/trace_clock.h>
 
 #include <clocksource/arm_arch_timer.h>
 
@@ -578,7 +579,10 @@ static void arch_counter_set_user_access(void)
 			| ARCH_TIMER_USR_PCT_ACCESS_EN);
 
 	/* Enable user access to the virtual counter */
-	cntkctl |= ARCH_TIMER_USR_VCT_ACCESS_EN;
+	if (IS_ENABLED(CONFIG_ARM_ARCH_TIMER_VCT_ACCESS))
+		cntkctl |= ARCH_TIMER_USR_VCT_ACCESS_EN;
+	else
+		cntkctl &= ~ARCH_TIMER_USR_VCT_ACCESS_EN;
 
 	arch_timer_set_cntkctl(cntkctl);
 }
@@ -697,6 +701,11 @@ static cycle_t arch_counter_read(struct clocksource *cs)
 }
 
 static cycle_t arch_counter_read_cc(const struct cyclecounter *cc)
+{
+	return arch_timer_read_counter();
+}
+
+u64 trace_arm64_tsc()
 {
 	return arch_timer_read_counter();
 }
@@ -837,7 +846,8 @@ static int __init arch_timer_register(void)
 	case PHYS_NONSECURE_PPI:
 		err = request_percpu_irq(ppi, arch_timer_handler_phys,
 					 "arch_timer", arch_timer_evt);
-		if (!err && arch_timer_ppi[PHYS_NONSECURE_PPI]) {
+		if (!err && arch_timer_ppi[PHYS_NONSECURE_PPI] &&
+				IS_ENABLED(CONFIG_ARM)) {
 			ppi = arch_timer_ppi[PHYS_NONSECURE_PPI];
 			err = request_percpu_irq(ppi, arch_timer_handler_phys,
 						 "arch_timer", arch_timer_evt);
@@ -981,9 +991,14 @@ static int __init arch_timer_init(void)
 			arch_timer_uses_ppi = HYP_PPI;
 			has_ppi = !!arch_timer_ppi[HYP_PPI];
 		} else {
-			arch_timer_uses_ppi = PHYS_SECURE_PPI;
-			has_ppi = (!!arch_timer_ppi[PHYS_SECURE_PPI] ||
+			if (IS_ENABLED(CONFIG_ARM64)) {
+				arch_timer_uses_ppi = PHYS_NONSECURE_PPI;
+				has_ppi = !!arch_timer_ppi[PHYS_NONSECURE_PPI];
+			} else {
+				arch_timer_uses_ppi = PHYS_SECURE_PPI;
+				has_ppi = (!!arch_timer_ppi[PHYS_SECURE_PPI] ||
 				   !!arch_timer_ppi[PHYS_NONSECURE_PPI]);
+			}
 		}
 
 		if (!has_ppi) {

@@ -31,6 +31,7 @@
 #include <linux/compiler.h>
 #include <linux/llist.h>
 #include <linux/bitops.h>
+#include <linux/sizes.h>
 #include <linux/overflow.h>
 
 #include <asm/uaccess.h>
@@ -605,13 +606,22 @@ static void vmap_debug_free_range(unsigned long start, unsigned long end)
  * code, and it will be simple to change the scale factor if we find that it
  * becomes a problem on bigger systems.
  */
+
+int sysctl_lazy_vfree_pages = 32UL * 1024 * 1024 / PAGE_SIZE;
+
+/*
+ * lazy_vfree_tlb_flush_all_threshold is the maximum size of TLB flush by
+ * area. Beyond that the whole TLB will be flushed.
+ */
+int sysctl_lazy_vfree_tlb_flush_all_threshold = SZ_512M;
+
 static unsigned long lazy_max_pages(void)
 {
 	unsigned int log;
 
 	log = fls(num_online_cpus());
 
-	return log * (32UL * 1024 * 1024 / PAGE_SIZE);
+	return log * sysctl_lazy_vfree_pages;
 }
 
 static atomic_t vmap_lazy_nr = ATOMIC_INIT(0);
@@ -673,8 +683,13 @@ static void __purge_vmap_area_lazy(unsigned long *start, unsigned long *end,
 	if (nr)
 		atomic_sub(nr, &vmap_lazy_nr);
 
-	if (nr || force_flush)
-		flush_tlb_kernel_range(*start, *end);
+	if (nr || force_flush) {
+		if (nr > (sysctl_lazy_vfree_tlb_flush_all_threshold >> PAGE_SHIFT))
+			flush_tlb_all();
+		else
+			llist_for_each_entry(va, valist, purge_list)
+				flush_tlb_kernel_range(va->va_start, va->va_end);
+	}
 
 	if (nr) {
 		spin_lock(&vmap_area_lock);
@@ -1431,6 +1446,7 @@ struct vm_struct *get_vm_area(unsigned long size, unsigned long flags)
 				  NUMA_NO_NODE, GFP_KERNEL,
 				  __builtin_return_address(0));
 }
+EXPORT_SYMBOL_GPL(get_vm_area);
 
 struct vm_struct *get_vm_area_caller(unsigned long size, unsigned long flags,
 				const void *caller)

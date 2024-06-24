@@ -983,7 +983,12 @@ static int of_pmu_irq_cfg(struct arm_pmu *pmu)
 		/* Keep track of the CPUs containing this PMU type */
 		cpumask_set_cpu(cpu, &pmu->supported_cpus);
 		i++;
-	} while (1);
+
+		/*
+		 * There is a possibility that nr_cpu_ids > number of phandles
+		 * for interrupt-affinity. In such case, just breaks out.
+		 */
+	} while (i < nr_cpu_ids);
 
 	/* If we didn't manage to parse anything, try the interrupt affinity */
 	if (cpumask_weight(&pmu->supported_cpus) == 0) {
@@ -1005,7 +1010,7 @@ static int of_pmu_irq_cfg(struct arm_pmu *pmu)
 	}
 
 	/* If we matched up the IRQ affinities, use them to route the SPIs */
-	if (using_spi && i == pdev->num_resources)
+	if (using_spi && i <= pdev->num_resources)
 		pmu->irq_affinity = irqs;
 	else
 		kfree(irqs);
@@ -1018,7 +1023,7 @@ int arm_pmu_device_probe(struct platform_device *pdev,
 			 const struct pmu_probe_info *probe_table)
 {
 	const struct of_device_id *of_id;
-	const int (*init_fn)(struct arm_pmu *);
+	int (*init_fn)(struct arm_pmu *);
 	struct device_node *node = pdev->dev.of_node;
 	struct arm_pmu *pmu;
 	int ret = -ENODEV;

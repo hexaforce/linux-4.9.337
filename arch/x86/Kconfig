@@ -19,7 +19,6 @@ config X86
 	def_bool y
 	select ACPI_LEGACY_TABLES_LOOKUP	if ACPI
 	select ACPI_SYSTEM_POWER_STATES_SUPPORT	if ACPI
-	select ANON_INODES
 	select ARCH_CLOCKSOURCE_DATA
 	select ARCH_DISCARD_MEMBLOCK
 	select ARCH_HAS_ACPI_TABLE_UPGRADE if ACPI
@@ -2270,6 +2269,10 @@ config MODIFY_LDT_SYSCALL
 source "kernel/livepatch/Kconfig"
 
 endmenu
+
+config ARCH_HAS_ADD_PAGES
+	def_bool y
+	depends on X86_64 && ARCH_ENABLE_MEMORY_HOTPLUG
 
 config ARCH_ENABLE_MEMORY_HOTPLUG
 	def_bool y

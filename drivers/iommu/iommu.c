@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2007-2008 Advanced Micro Devices, Inc.
+ * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
  * Author: Joerg Roedel <jroedel@suse.de>
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -1091,6 +1092,16 @@ void iommu_domain_free(struct iommu_domain *domain)
 }
 EXPORT_SYMBOL_GPL(iommu_domain_free);
 
+int iommu_get_hwid(struct iommu_domain *domain, struct device *dev,
+		   unsigned int id)
+{
+	if (unlikely(domain->ops->get_hwid == NULL))
+		return -ENODEV;
+
+	return domain->ops->get_hwid(domain, dev, id);
+}
+EXPORT_SYMBOL_GPL(iommu_get_hwid);
+
 static int __iommu_attach_device(struct iommu_domain *domain,
 				 struct device *dev)
 {
@@ -1289,7 +1300,7 @@ static size_t iommu_pgsize(struct iommu_domain *domain,
 	pgsize_idx = __fls(size);
 
 	/* need to consider alignment requirements ? */
-	if (likely(addr_merge)) {
+	if (!domain->ops->ignore_align && addr_merge) {
 		/* Max page size allowed by address */
 		unsigned int align_pgsize_idx = __ffs(addr_merge);
 		pgsize_idx = min(pgsize_idx, align_pgsize_idx);
@@ -1312,7 +1323,7 @@ static size_t iommu_pgsize(struct iommu_domain *domain,
 }
 
 int iommu_map(struct iommu_domain *domain, unsigned long iova,
-	      phys_addr_t paddr, size_t size, int prot)
+	      phys_addr_t paddr, size_t size, ulong prot)
 {
 	unsigned long orig_iova = iova;
 	unsigned int min_pagesz;
@@ -1402,9 +1413,9 @@ size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
 	 * or we hit an area that isn't mapped.
 	 */
 	while (unmapped < size) {
-		size_t pgsize = iommu_pgsize(domain, iova, size - unmapped);
+		size_t left = size - unmapped;
 
-		unmapped_page = domain->ops->unmap(domain, iova, pgsize);
+		unmapped_page = domain->ops->unmap(domain, iova, left);
 		if (!unmapped_page)
 			break;
 
@@ -1421,7 +1432,7 @@ size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
 EXPORT_SYMBOL_GPL(iommu_unmap);
 
 size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
-			 struct scatterlist *sg, unsigned int nents, int prot)
+			 struct scatterlist *sg, unsigned int nents, ulong prot)
 {
 	struct scatterlist *s;
 	size_t mapped = 0;

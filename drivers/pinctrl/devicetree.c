@@ -212,10 +212,8 @@ int pinctrl_dt_to_map(struct pinctrl *p)
 		prop = of_find_property(np, propname, &size);
 		kfree(propname);
 		if (!prop) {
-			if (state == 0) {
-				of_node_put(np);
-				return -ENODEV;
-			}
+			if (state == 0)
+				return 0;
 			break;
 		}
 		list = prop->value;

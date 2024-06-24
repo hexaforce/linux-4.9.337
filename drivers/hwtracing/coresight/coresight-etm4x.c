@@ -35,6 +35,7 @@
 #include <linux/pm_runtime.h>
 #include <asm/sections.h>
 #include <asm/local.h>
+#include <linux/of.h>
 #include <asm/virt.h>
 
 #include "coresight-etm4x.h"
@@ -963,17 +964,24 @@ static int etm4_probe(struct amba_device *adev, const struct amba_id *id)
 	struct resource *res = &adev->res;
 	struct coresight_desc desc = { 0 };
 	struct device_node *np = adev->dev.of_node;
-
-	drvdata = devm_kzalloc(dev, sizeof(*drvdata), GFP_KERNEL);
-	if (!drvdata)
-		return -ENOMEM;
+	struct device_node *np_cpu = NULL;
 
 	if (np) {
 		pdata = of_get_coresight_platform_data(dev, np);
 		if (IS_ERR(pdata))
 			return PTR_ERR(pdata);
+		np_cpu = of_parse_phandle(np, "cpu", 0);
+		if (np_cpu != of_get_cpu_node(pdata->cpu, NULL)) {
+			dev_err(dev, "Init CPU %d isn't the binding CPU in DTB!\n",
+				pdata->cpu);
+			return -ENODEV;
+		}
 		adev->dev.platform_data = pdata;
 	}
+
+	drvdata = devm_kzalloc(dev, sizeof(*drvdata), GFP_KERNEL);
+	if (!drvdata)
+		return -ENOMEM;
 
 	drvdata->dev = &adev->dev;
 	dev_set_drvdata(dev, drvdata);
@@ -1037,7 +1045,8 @@ static int etm4_probe(struct amba_device *adev, const struct amba_id *id)
 	}
 
 	pm_runtime_put(&adev->dev);
-	dev_info(dev, "%s initialized\n", (char *)id->data);
+	dev_info(dev, "CPU%d: %s initialized\n",
+			drvdata->cpu, (char *)id->data);
 
 	if (boot_enable) {
 		coresight_enable(drvdata->csdev);
@@ -1056,20 +1065,25 @@ err_arch_supported:
 }
 
 static struct amba_id etm4_ids[] = {
-	{       /* ETM 4.0 - Cortex-A53  */
+	{
 		.id	= 0x000bb95d,
 		.mask	= 0x000fffff,
-		.data	= "ETM 4.0",
+		.data	= "Cortex-A53 ETM v4.0",
 	},
-	{       /* ETM 4.0 - Cortex-A57 */
+	{
 		.id	= 0x000bb95e,
 		.mask	= 0x000fffff,
-		.data	= "ETM 4.0",
+		.data	= "Cortex-A57 ETM v4.0",
 	},
-	{       /* ETM 4.0 - A72, Maia, HiSilicon */
+	{
 		.id = 0x000bb95a,
 		.mask = 0x000fffff,
-		.data = "ETM 4.0",
+		.data	= "Cortex-A72 ETM v4.0",
+	},
+	{
+		.id = 0x000bb959,
+		.mask = 0x000fffff,
+		.data	= "Cortex-A73 ETM v4.0",
 	},
 	{ 0, 0},
 };

@@ -1555,6 +1555,8 @@ of_register_spi_device(struct spi_master *master, struct device_node *nc)
 		spi->mode |= SPI_3WIRE;
 	if (of_find_property(nc, "spi-lsb-first", NULL))
 		spi->mode |= SPI_LSB_FIRST;
+	if (of_find_property(nc, "spi-lsbyte-first", NULL))
+		spi->mode |= SPI_LSBYTE_FIRST;
 
 	/* Device DUAL/QUAD mode */
 	if (!of_property_read_u32(nc, "spi-tx-bus-width", &value)) {
@@ -1640,6 +1642,8 @@ static void of_register_spi_devices(struct spi_master *master)
 
 	for_each_available_child_of_node(master->dev.of_node, nc) {
 		if (of_node_test_and_set_flag(nc, OF_POPULATED))
+			continue;
+		if (!strcmp(nc->name, "prod-settings"))
 			continue;
 		spi = of_register_spi_device(master, nc);
 		if (IS_ERR(spi)) {
@@ -2088,6 +2092,8 @@ void spi_unregister_master(struct spi_master *master)
 		if (spi_destroy_queue(master))
 			dev_err(&master->dev, "queue remove failed\n");
 	}
+
+	device_for_each_child(&master->dev, NULL, __unregister);
 
 	mutex_lock(&board_lock);
 	list_del(&master->list);
@@ -2595,10 +2601,11 @@ int spi_setup(struct spi_device *spi)
 
 	spi_set_cs(spi, false);
 
-	dev_dbg(&spi->dev, "setup mode %d, %s%s%s%s%u bits/w, %u Hz max --> %d\n",
+	dev_dbg(&spi->dev, "setup mode %d, %s%s%s%s%s%u bits/w, %u Hz max --> %d\n",
 			(int) (spi->mode & (SPI_CPOL | SPI_CPHA)),
 			(spi->mode & SPI_CS_HIGH) ? "cs_high, " : "",
 			(spi->mode & SPI_LSB_FIRST) ? "lsb, " : "",
+			(spi->mode & SPI_LSBYTE_FIRST) ? "lsbyte, " : "",
 			(spi->mode & SPI_3WIRE) ? "3wire, " : "",
 			(spi->mode & SPI_LOOP) ? "loopback, " : "",
 			spi->bits_per_word, spi->max_speed_hz,
@@ -3150,6 +3157,29 @@ int spi_write_then_read(struct spi_device *spi,
 	return status;
 }
 EXPORT_SYMBOL_GPL(spi_write_then_read);
+
+/**
+ * spi_cs_low - set chip select pin state
+ * @spi: device for which chip select pin state to be set
+ * state: if true chip select pin will be kept low else high
+ *
+ * The return value is zero for success, else
+ * errno status code.
+ */
+int spi_cs_low(struct spi_device *spi, bool state)
+{
+	struct spi_master *master = spi->master;
+	int ret = 0;
+
+	mutex_lock(&master->bus_lock_mutex);
+
+	if (master->spi_cs_low)
+		ret = master->spi_cs_low(spi, state);
+
+	mutex_unlock(&master->bus_lock_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(spi_cs_low);
 
 /*-------------------------------------------------------------------------*/
 

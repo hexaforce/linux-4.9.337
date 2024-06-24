@@ -347,6 +347,7 @@ struct hid_item {
 #define HID_GROUP_RMI				0x0100
 #define HID_GROUP_WACOM				0x0101
 #define HID_GROUP_LOGITECH_DJ_DEVICE		0x0102
+#define HID_GROUP_STEAM				0x0103
 
 /*
  * This is the global environment of the parser. This information is
@@ -525,10 +526,12 @@ struct hid_device {							/* device report descriptor */
 	 * battery is non-NULL.
 	 */
 	struct power_supply *battery;
+	__s32 battery_capacity;
 	__s32 battery_min;
 	__s32 battery_max;
 	__s32 battery_report_type;
 	__s32 battery_report_id;
+	bool battery_reported;
 #endif
 
 	unsigned int status;						/* see STAT flags above */
@@ -844,6 +847,8 @@ const struct hid_device_id *hid_match_id(struct hid_device *hdev,
 s32 hid_snto32(__u32 value, unsigned n);
 __u32 hid_field_extract(const struct hid_device *hid, __u8 *report,
 		     unsigned offset, unsigned n);
+int uhid_hid_output_raw(struct hid_device *hid, __u8 *buf, size_t count,
+			       unsigned char report_type);
 
 /**
  * hid_device_io_start - enable HID input during probe, remove

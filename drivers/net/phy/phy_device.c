@@ -80,7 +80,7 @@ static LIST_HEAD(phy_fixup_list);
 static DEFINE_MUTEX(phy_fixup_lock);
 
 #ifdef CONFIG_PM
-static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
+static bool mdio_bus_phy_may_suspend(struct phy_device *phydev, bool suspend)
 {
 	struct device_driver *drv = phydev->mdio.dev.driver;
 	struct phy_driver *phydrv = to_phy_driver(drv);
@@ -92,7 +92,8 @@ static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
 	/* PHY not attached? May suspend if the PHY has not already been
 	 * suspended as part of a prior call to phy_disconnect() ->
 	 * phy_detach() -> phy_suspend() because the parent netdev might be the
-	 * MDIO bus driver and clock gated at this point.
+	 * MDIO bus driver and clock gated at this point. Also may resume if
+	 * PHY is not attached.
 	 */
 	if (!netdev)
 		goto out;
@@ -126,7 +127,7 @@ static int mdio_bus_phy_suspend(struct device *dev)
 	if (phydev->attached_dev && phydev->adjust_link)
 		phy_stop_machine(phydev);
 
-	if (!mdio_bus_phy_may_suspend(phydev))
+	if (!mdio_bus_phy_may_suspend(phydev, true))
 		return 0;
 
 	phydev->suspended_by_mdio_bus = true;
@@ -361,7 +362,7 @@ struct phy_device *phy_device_create(struct mii_bus *bus, int addr, int phy_id,
 	 * driver will get bored and give up as soon as it finds that
 	 * there's no driver _already_ loaded.
 	 */
-	request_module(MDIO_MODULE_PREFIX MDIO_ID_FMT, MDIO_ID_ARGS(phy_id));
+	request_module_nowait(MDIO_MODULE_PREFIX MDIO_ID_FMT, MDIO_ID_ARGS(phy_id));
 
 	device_initialize(&mdiodev->dev);
 
@@ -1678,13 +1679,6 @@ static int phy_probe(struct device *dev)
 
 	phydev->drv = phydrv;
 
-	/* Disable the interrupt if the PHY doesn't support it
-	 * but the interrupt is still a valid one
-	 */
-	if (!(phydrv->flags & PHY_HAS_INTERRUPT) &&
-	    phy_interrupt_is_valid(phydev))
-		phydev->irq = PHY_POLL;
-
 	if (phydrv->flags & PHY_IS_INTERNAL)
 		phydev->is_internal = true;
 
@@ -1708,6 +1702,15 @@ static int phy_probe(struct device *dev)
 
 	if (phydev->drv->probe)
 		err = phydev->drv->probe(phydev);
+
+	/* Disable the interrupt if the PHY doesn't support it
+	 * but the interrupt is still a valid one
+	 */
+	if (!(phydrv->flags & PHY_HAS_INTERRUPT) &&
+	    phy_interrupt_is_valid(phydev))
+		phydev->irq = PHY_POLL;
+
+	phydev->suspended = true;
 
 	mutex_unlock(&phydev->lock);
 
